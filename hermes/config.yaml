@@ -1,0 +1,151 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Talos Engine - Hermes Agent Configuration Template
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# This is the primary configuration file for Hermes Agent.
+# Replace placeholder values (YOUR_*) with your actual keys.
+# See: https://hermes-agent.nousresearch.com/docs
+
+# ─── Model Configuration ────────────────────────────────────────────────────
+model:
+  # The model to use for inference
+  name: "deepseek/deepseek-v4-pro"
+
+  # Provider type: "custom" for self-hosted/proxy endpoints
+  provider: "custom"
+
+  # Base URL for the API endpoint (OrcaRouter or compatible proxy)
+  base_url: "https://your-orcarouter-endpoint.com/v1"
+
+  # API key (get from your provider)
+  api_key: "YOUR_API_KEY_HERE"
+
+# ─── Context & Memory ───────────────────────────────────────────────────────
+context:
+  # Maximum context window (tokens)
+  max_tokens: 100000
+
+  # Conversation history length to maintain
+  history_length: 50
+
+  # Auto-summarize when approaching context limit
+  auto_summarize: true
+
+  # Summarization threshold (% of max_tokens)
+  summarize_threshold: 0.75
+
+# ─── Tools Configuration ────────────────────────────────────────────────────
+tools:
+  # Enable tool calling (function calling)
+  enabled: true
+
+  # Tool execution timeout (seconds)
+  timeout: 120
+
+  # Auto-approve tools matching these patterns (be careful!)
+  auto_approve: []
+
+  # Maximum concurrent tool calls
+  max_concurrent: 5
+
+# ─── Browser Automation (Browser Use) ───────────────────────────────────────
+browser:
+  enabled: true
+  headless: true
+  viewport_width: 1280
+  viewport_height: 720
+  timeout: 30000
+
+# ─── Web Tools (Firecrawl) ──────────────────────────────────────────────────
+firecrawl:
+  enabled: true
+  api_key: "YOUR_FIRECRAWL_API_KEY"
+
+# ─── Image Generation (FAL) ─────────────────────────────────────────────────
+image_generation:
+  enabled: true
+  provider: "fal"
+  api_key: "YOUR_FAL_API_KEY"
+
+# ─── Speech Services ────────────────────────────────────────────────────────
+speech:
+  tts:
+    enabled: true
+    provider: "openai"
+    api_key: "YOUR_OPENAI_API_KEY"
+    voice: "alloy"
+    model: "tts-1"
+
+  stt:
+    enabled: true
+    provider: "openai"
+    api_key: "YOUR_OPENAI_API_KEY"
+    model: "whisper-1"
+
+# ─── Notifications (Telegram) ───────────────────────────────────────────────
+telegram:
+  enabled: false
+  bot_token: "YOUR_BOT_TOKEN"
+  # Default chat ID for alerts
+  chat_id: "YOUR_CHAT_ID"
+  # Additional authorized chat IDs
+  authorized_chats:
+    - "YOUR_CHAT_ID"
+  # Enable real-time alerts for thresholds
+  alert_on:
+    - error
+    - critical
+    - reboot
+    - high_usage
+
+# ─── Execution Environment ──────────────────────────────────────────────────
+execution:
+  # Modal execution (cloud compute, optional)
+  modal:
+    enabled: false
+    token_id: "YOUR_MODAL_TOKEN_ID"
+    token_secret: "YOUR_MODAL_TOKEN_SECRET"
+
+  # Local execution settings
+  local:
+    max_parallel_tasks: 4
+    task_timeout: 600
+
+# ─── Plugins ────────────────────────────────────────────────────────────────
+plugins:
+  # RTK Rewrite plugin — rewrites tool calls with context-aware formatting
+  rtk_rewrite:
+    enabled: true
+    config:
+      format: "markdown"
+      include_context: true
+
+# ─── Cron Scheduler ─────────────────────────────────────────────────────────
+cron:
+  enabled: true
+  jobs_file: "hermes/cron/jobs.json"
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"
+  file: "~/.hermes/logs/hermes.log"
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+# ─── Profiles ───────────────────────────────────────────────────────────────
+profiles:
+  # Default profile name
+  active: "default"
+
+# ─── Security ───────────────────────────────────────────────────────────────
+security:
+  # Require confirmation for destructive operations
+  confirm_destructive: true
+
+  # Sandbox file operations to workspace
+  sandbox_files: false
+
+  # Max file size for reading (bytes)
+  max_file_read: 1048576
+
+  # Allowed command prefixes (empty = all allowed, with confirmation)
+  allowed_commands: []

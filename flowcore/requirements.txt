@@ -1,0 +1,6 @@
+aiohttp>=3.9
+aiohttp-socks>=0.8
+pyyaml>=6.0
+playwright>=1.40
+python-socks>=2.4
+pillow>=10.0

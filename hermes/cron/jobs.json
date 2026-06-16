@@ -1,0 +1,78 @@
+{
+  "description": "Talos Engine — Cron Job Schedule",
+  "version": "1.0.0",
+  "jobs": [
+    {
+      "name": "talos-reboot-monitor",
+      "schedule": "@reboot",
+      "command": "python3 ~/repos/talos-engine/scripts/reboot_monitor.py --init",
+      "description": "Initialize boot state on system startup"
+    },
+    {
+      "name": "talos-memory-check",
+      "schedule": "0 * * * *",
+      "command": "python3 ~/repos/talos-engine/scripts/memory_monitor.py",
+      "description": "Hourly RAM usage check with threshold alerts"
+    },
+    {
+      "name": "talos-disk-alert",
+      "schedule": "0 */6 * * *",
+      "command": "bash ~/repos/talos-engine/scripts/disk_alert.sh",
+      "description": "Disk usage check every 6 hours"
+    },
+    {
+      "name": "talos-server-monitor",
+      "schedule": "*/15 * * * *",
+      "command": "python3 ~/repos/talos-engine/scripts/monitor.py --silent",
+      "description": "Full server health check every 15 minutes"
+    },
+    {
+      "name": "talos-context-monitor",
+      "schedule": "0 */2 * * *",
+      "command": "python3 ~/repos/talos-engine/scripts/context_monitor.py",
+      "description": "Hermes Agent context usage check every 2 hours"
+    },
+    {
+      "name": "talos-daily-report",
+      "schedule": "0 9 * * *",
+      "command": "python3 ~/repos/talos-engine/scripts/daily_report.py",
+      "description": "Daily briefing at 9 AM — token usage, health, errors"
+    },
+    {
+      "name": "talos-error-summary",
+      "schedule": "0 */6 * * *",
+      "command": "python3 ~/repos/talos-engine/scripts/error_summary.py --since 6h",
+      "description": "Error log summary every 6 hours"
+    },
+    {
+      "name": "talos-ssh-monitor",
+      "schedule": "*/30 * * * *",
+      "command": "python3 ~/repos/talos-engine/scripts/ssh_attack_monitor.py --threshold 15",
+      "description": "SSH attack detection every 30 minutes"
+    },
+    {
+      "name": "talos-proxy-refresh",
+      "schedule": "0 */4 * * *",
+      "command": "python3 ~/repos/talos-engine/scripts/proxy_updater.py",
+      "description": "Refresh proxy pool every 4 hours"
+    },
+    {
+      "name": "talos-income-scanner",
+      "schedule": "0 */6 * * *",
+      "command": "python3 ~/repos/talos-engine/scripts/income_pipeline.py --output data/opportunities.json",
+      "description": "Scan for income opportunities every 6 hours"
+    },
+    {
+      "name": "talos-session-cleanup",
+      "schedule": "0 3 * * 0",
+      "command": "bash ~/repos/talos-engine/scripts/prune.sh --days 30",
+      "description": "Weekly session cleanup on Sunday at 3 AM"
+    },
+    {
+      "name": "talos-config-backup",
+      "schedule": "0 2 * * 0",
+      "command": "bash ~/repos/talos-engine/scripts/vps_backup.sh",
+      "description": "Weekly config backup on Sunday at 2 AM"
+    }
+  ]
+}

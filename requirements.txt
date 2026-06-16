@@ -1,0 +1,9 @@
+# Talos Engine — Combined Python Dependencies
+aiohttp>=3.13
+aiohttp-socks>=0.11
+pyyaml>=6.0
+playwright>=1.60
+python-socks>=2.8
+pillow>=12.0
+python-telegram-bot>=22.0
+python-dotenv>=1.2
