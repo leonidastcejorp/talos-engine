@@ -1,0 +1,21 @@
+# Talos Engine — .gitignore
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+.venv/
+__pycache__/
+.env
+*.rdb
+*.pid
+*.db
+*.db-shm
+*.db-wal
+state.db
+auth.json
+auth.lock
+gateway.lock
+gateway.pid
+.hermes_history
+output/
