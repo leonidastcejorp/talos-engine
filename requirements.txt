@@ -7,3 +7,12 @@ python-socks>=2.8
 pillow>=12.0
 python-telegram-bot>=22.0
 python-dotenv>=1.2
+
+# Farm infrastructure
+eth-account>=0.13
+mnemonic>=0.21
+cryptography>=42.0
+web3>=7.0
+
+# Bounty infrastructure
+jinja2>=3.1

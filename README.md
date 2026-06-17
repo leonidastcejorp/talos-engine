@@ -27,14 +27,16 @@ talos-engine/
 │   ├── config/         # Framework configuration
 │   ├── scripts/        # CLI entry points
 │   └── tests/          # Unit tests
-├── scripts/            # 📡 Monitoring & automation scripts
+├── farm/              # ✈️ Airdrop farming infra (wallet, proxy, profile, runner)
+├── bounty/            # 🛡️ Bug bounty recon pipeline + report generator
+├── scripts/           # 📡 Monitoring & automation scripts
 │   └── lib/            # Shared libraries (error logging)
-├── hermes/             # 🤖 Hermes Agent configuration
+├── hermes/            # 🤖 Hermes Agent configuration
 │   ├── cron/           # Cron job definitions & deployer
 │   ├── plugins/        # Agent plugins (RTK rewrite)
 │   └── scripts/        # Agent scripts (monitoring, pipelines)
-├── tools/              # 🔧 Standalone utilities
-└── data/               # 📊 Runtime data
+├── tools/             # 🔧 Standalone utilities
+└── data/              # 📊 Runtime data
 ```
 
 ## Requirements
@@ -73,6 +75,24 @@ bash hermes/cron/deploy-cron.sh
 # Verify
 python3 scripts/monitor.py
 ```
+
+## New Modules
+
+### 🌾 Farm (Airdrop Farming)
+
+| Module | File | Description |
+|--------|------|-------------|
+| Wallet | `farm/wallet.py` | Encrypted HD wallet manager for EVM |
+| Proxy | `farm/proxy.py` | Health-checked proxy pool + rotation |
+| Profile | `farm/profile.py` | Isolated browser profiles + fingerprint |
+| Runner | `farm/runner.py` | Execute tasks per wallet/profile/proxy |
+
+### 🛡️ Bounty (Bug Bounty Recon)
+
+| Module | File | Description |
+|--------|------|-------------|
+| Recon | `bounty/recon.py` | subfinder → httpx → nuclei pipeline |
+| Report | `bounty/report.py` | Markdown report generator |
 
 ## Components
 
