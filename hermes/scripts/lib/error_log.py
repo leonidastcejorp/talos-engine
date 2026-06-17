@@ -1,229 +1,261 @@
+#!/usr/bin/env python3
 """
-Talos Engine - Structured Error Logger
-
-Provides leveled error logging with filtering, aggregation,
-and Telegram-formatted output for monitoring scripts.
+🔧 BREACH Error Log — shared error logging (HTML mode, G20 style).
 """
+from __future__ import annotations
 
 import json
-import logging
-import time
-from collections import defaultdict
-from dataclasses import dataclass, field
-from enum import IntEnum
-from pathlib import Path
-from typing import Dict, List, Optional
+import os
+import re
+import sys
+import traceback
+from datetime import datetime
+
+ERROR_LOG_PATH = os.path.expanduser("~/.hermes/scripts/.error_log.json")
+MAX_ENTRIES = 500
+
+_LEVEL_ORDER = ["INFO", "WARNING", "ERROR", "CRITICAL"]
+_LEVEL_ICON = {"INFO": "ℹ️", "WARNING": "🟡", "ERROR": "🔴", "CRITICAL": "💀"}
 
 
-class ErrorLevel(IntEnum):
-    """Error severity levels matching syslog."""
-    DEBUG = 7
-    INFO = 6
-    NOTICE = 5
-    WARNING = 4
-    ERROR = 3
-    CRITICAL = 2
-    ALERT = 1
-    EMERGENCY = 0
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-LEVEL_NAMES = {
-    ErrorLevel.DEBUG: "DEBUG",
-    ErrorLevel.INFO: "INFO",
-    ErrorLevel.NOTICE: "NOTICE",
-    ErrorLevel.WARNING: "WARNING",
-    ErrorLevel.ERROR: "ERROR",
-    ErrorLevel.CRITICAL: "CRITICAL",
-    ErrorLevel.ALERT: "ALERT",
-    ErrorLevel.EMERGENCY: "EMERGENCY",
-}
-
-LEVEL_EMOJI = {
-    ErrorLevel.DEBUG: "🔍",
-    ErrorLevel.INFO: "ℹ️",
-    ErrorLevel.NOTICE: "📌",
-    ErrorLevel.WARNING: "⚠️",
-    ErrorLevel.ERROR: "❌",
-    ErrorLevel.CRITICAL: "🔥",
-    ErrorLevel.ALERT: "🚨",
-    ErrorLevel.EMERGENCY: "💀",
-}
+def _now_short() -> str:
+    return datetime.now().strftime("%H:%M")
 
 
-@dataclass
-class ErrorEntry:
-    """A single error log entry."""
-    timestamp: float = field(default_factory=time.time)
-    level: ErrorLevel = ErrorLevel.ERROR
-    source: str = "unknown"
-    message: str = ""
-    details: Optional[dict] = None
+def _split_title(title: str) -> str:
+    """Auto-split camelcase: 'VitalSign' → 'vital sign'."""
+    words = re.sub(r'([a-z])([A-Z])', r'\1 \2', title)
+    words = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', words)
+    return words.rstrip(".").lower() + "."
 
-    @property
-    def level_name(self) -> str:
-        return LEVEL_NAMES.get(self.level, "UNKNOWN")
 
-    @property
-    def emoji(self) -> str:
-        return LEVEL_EMOJI.get(self.level, "❓")
+def _esc(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
 
-    def to_dict(self) -> dict:
-        return {
-            "timestamp": self.timestamp,
-            "level": self.level.value,
-            "level_name": self.level_name,
-            "source": self.source,
-            "message": self.message,
-            "details": self.details,
-        }
 
-    def to_telegram_line(self) -> str:
-        """Format as a single Telegram message line."""
-        import datetime
-        ts = datetime.datetime.fromtimestamp(self.timestamp).strftime("%H:%M:%S")
-        return f"{self.emoji} `{ts}` **{self.source}**: {self.message}"
+def _render_table(headers: list[str], rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    rows = [[str(c) for c in r] for r in rows]
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+    def fmt_row(cells):
+        return "│ " + " │ ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " │"
+    sep = "├─" + "─┼─".join("─" * w for w in widths) + "─┤"
+    top = "┌─" + "─┬─".join("─" * w for w in widths) + "─┐"
+    bot = "└─" + "─┴─".join("─" * w for w in widths) + "─┘"
+    lines = [top, fmt_row(headers), sep]
+    for row in rows:
+        lines.append(fmt_row(row))
+    lines.append(bot)
+    return "\n".join(lines)
 
 
 class ErrorLog:
-    """In-memory error log with filtering and aggregation."""
+    def __init__(self, display_name: str):
+        self.display_name = display_name
+        self.script_name = display_name.replace(" ", "_").lower()[:32]
+        self.entries: list[dict] = []
+        self.ok_messages: list[str] = []
 
-    def __init__(
-        self,
-        log_file: Optional[str] = None,
-        min_level: ErrorLevel = ErrorLevel.WARNING,
-        max_entries: int = 1000,
-    ):
-        self.log_file = Path(log_file) if log_file else None
-        self.min_level = min_level
-        self.max_entries = max_entries
-        self._entries: List[ErrorEntry] = []
+    def _add(self, level: str, judul: str, detail: str, saran: str = "") -> None:
+        self.entries.append({
+            "ts": _now(),
+            "script": self.script_name,
+            "display_name": self.display_name,
+            "level": level,
+            "judul": judul[:80],
+            "detail": detail[:250],
+            "saran": saran[:200],
+        })
 
-    def log(
-        self,
-        message: str,
-        level: ErrorLevel = ErrorLevel.ERROR,
-        source: str = "unknown",
-        details: Optional[dict] = None,
-    ):
-        """Record an error entry. Drops entries below min_level."""
-        if level > self.min_level:
-            return
+    def critical(self, judul: str, detail: str, saran: str = "") -> None:
+        self._add("CRITICAL", judul, detail, saran)
 
-        entry = ErrorEntry(
-            level=level,
-            source=source,
-            message=message,
-            details=details,
-        )
-        self._entries.append(entry)
+    def error(self, judul: str, detail: str, saran: str = "") -> None:
+        self._add("ERROR", judul, detail, saran)
 
-        # Trim if over max
-        if len(self._entries) > self.max_entries:
-            self._entries = self._entries[-self.max_entries:]
+    def warning(self, judul: str, detail: str, saran: str = "") -> None:
+        self._add("WARNING", judul, detail, saran)
 
-        # Persist if file is set
-        if self.log_file:
-            self._append_to_file(entry)
+    def info(self, judul: str, detail: str = "") -> None:
+        self._add("INFO", judul, detail, "")
 
-    def _append_to_file(self, entry: ErrorEntry):
-        """Append a JSON line to the log file."""
+    def ok(self, judul: str, detail: str = "") -> None:
+        self.ok_messages.append(f"{judul} · {detail}" if detail else judul)
+
+    def exception(self, judul: str = "Script crash", saran: str = "") -> None:
+        exc_type, exc_value, _ = sys.exc_info()
+        detail = f"{exc_type.__name__}: {exc_value}" if exc_value else "Error gak dikenal"
+        self._add("ERROR", judul, detail, saran)
+
+    def ada_masalah(self) -> bool:
+        return any(e["level"] in ("CRITICAL", "ERROR", "WARNING") for e in self.entries)
+
+    def worst_level(self) -> str:
+        for level in reversed(_LEVEL_ORDER):
+            if any(e["level"] == level for e in self.entries):
+                return level
+        return "OK"
+
+    def format_report(self) -> str | None:
+        """Render error log jadi pesan HTML (G20 style)."""
+        if not self.entries and not self.ok_messages:
+            return None
+
+        lines = []
+
+        if self.entries:
+            sev = self.worst_level()
+            ico = _LEVEL_ICON.get(sev, "⚪")
+            title_clean = _split_title(self.display_name)
+            lines.append(f"{ico} ✦ <b>{_esc(title_clean)}</b>  <code>{_esc(_now_short())}</code>")
+            lines.append("")
+
+        for level in ("CRITICAL", "ERROR", "WARNING"):
+            lev = [e for e in self.entries if e["level"] == level]
+            if not lev:
+                continue
+            ico = _LEVEL_ICON[level]
+            lines.append(f"{ico} <b>{_esc(level)} ({len(lev)})</b>")
+            rows = []
+            for e in lev:
+                cell = e["judul"]
+                if e.get("detail"):
+                    cell += f"\n{_esc(e['detail'])}"
+                if e.get("saran"):
+                    cell += f"\n→ {_esc(e['saran'])}"
+                rows.append([cell])
+            content = _render_table(["Detail"], rows)
+            lines.append(f"<pre><tg-spoiler>{_esc(content)}</tg-spoiler></pre>")
+            lines.append("")
+
+        if self.ok_messages:
+            lines.append("✅ <b>status baik</b>")
+            content = _render_table(
+                ["Check", "Result"],
+                [[str(i + 1), m] for i, m in enumerate(self.ok_messages)],
+            )
+            lines.append(f"<pre><tg-spoiler>{_esc(content)}</tg-spoiler></pre>")
+            lines.append("")
+
+        lines.append(f"<i><code>{_esc(_now_short())}</code></i>")
+        return "\n".join(lines).rstrip()
+
+    def format_error_only(self) -> str | None:
+        bad = [e for e in self.entries if e["level"] in ("CRITICAL", "ERROR", "WARNING")]
+        if not bad:
+            return None
+        lines = []
+        for level in ("CRITICAL", "ERROR", "WARNING"):
+            lev = [e for e in bad if e["level"] == level]
+            if not lev:
+                continue
+            ico = _LEVEL_ICON[level]
+            lines.append(f"{ico} <b>{_esc(level)}</b>")
+            rows = []
+            for e in lev:
+                cell = e["judul"]
+                if e.get("detail"):
+                    cell += f"\n{_esc(e['detail'])}"
+                if e.get("saran"):
+                    cell += f"\n→ {_esc(e['saran'])}"
+                rows.append([cell])
+            content = _render_table(["Detail"], rows)
+            lines.append(f"<pre><tg-spoiler>{_esc(content)}</tg-spoiler></pre>")
+            lines.append("")
+        lines.append(f"<i><code>{_esc(_now_short())}</code></i>")
+        return "\n".join(lines).rstrip()
+
+    def persist(self) -> None:
+        existing: list = []
+        if os.path.exists(ERROR_LOG_PATH):
+            try:
+                with open(ERROR_LOG_PATH) as f:
+                    existing = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                existing = []
+        existing.extend(self.entries)
+        if len(existing) > MAX_ENTRIES:
+            existing = existing[-MAX_ENTRIES:]
+        os.makedirs(os.path.dirname(ERROR_LOG_PATH), exist_ok=True)
         try:
-            self.log_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.log_file, "a") as f:
-                f.write(json.dumps(entry.to_dict()) + "\n")
-        except Exception:
+            with open(ERROR_LOG_PATH, "w") as f:
+                json.dump(existing, f, indent=2)
+        except OSError:
             pass
 
-    def load_from_file(self):
-        """Load entries from a JSON-lines log file."""
-        if not self.log_file or not self.log_file.exists():
-            return
-        with open(self.log_file) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    entry = ErrorEntry(
-                        timestamp=data.get("timestamp", 0),
-                        level=ErrorLevel(data.get("level", 3)),
-                        source=data.get("source", "unknown"),
-                        message=data.get("message", ""),
-                        details=data.get("details"),
-                    )
-                    self._entries.append(entry)
-                except (json.JSONDecodeError, ValueError):
-                    pass
+    @staticmethod
+    def get_recent(limit: int = 20) -> list[dict]:
+        if not os.path.exists(ERROR_LOG_PATH):
+            return []
+        try:
+            with open(ERROR_LOG_PATH) as f:
+                data = json.load(f)
+            return data[-limit:]
+        except (json.JSONDecodeError, OSError):
+            return []
 
-    def get_entries(
-        self,
-        min_level: Optional[ErrorLevel] = None,
-        source: Optional[str] = None,
-        since: Optional[float] = None,
-        limit: int = 50,
-    ) -> List[ErrorEntry]:
-        """Filter and return entries."""
-        results = self._entries
-
-        if min_level is not None:
-            results = [e for e in results if e.level <= min_level]
-        if source is not None:
-            results = [e for e in results if e.source == source]
-        if since is not None:
-            results = [e for e in results if e.timestamp >= since]
-
-        return results[-limit:]
-
-    def summarize(self, since: Optional[float] = None) -> Dict[str, dict]:
-        """Aggregate errors by source and level."""
-        entries = self.get_entries(since=since) if since else self._entries
-        summary = defaultdict(lambda: defaultdict(int))
-        for entry in entries:
-            summary[entry.source][entry.level_name] += 1
-
-        return {
-            source: dict(level_counts)
-            for source, level_counts in summary.items()
-        }
-
-    def to_telegram_table(self, since: Optional[float] = None) -> str:
-        """Format error summary as a Telegram Markdown table."""
-        entries = self.get_entries(since=since, limit=50)
+    @staticmethod
+    def format_summary(limit: int = 10) -> str | None:
+        entries = ErrorLog.get_recent(limit)
         if not entries:
-            return "✅ No errors in the selected period."
+            return None
+        bad = [e for e in entries if e["level"] in ("CRITICAL", "ERROR", "WARNING")]
+        if not bad:
+            return None
 
-        lines = ["📊 *Error Summary*", ""]
-        lines.append("| Time | Level | Source | Message |")
-        lines.append("|---|---|---|---|")
-        for entry in entries[-20:]:
-            import datetime
-            ts = datetime.datetime.fromtimestamp(entry.timestamp).strftime("%H:%M")
-            lines.append(
-                f"| {ts} | {entry.emoji} | {entry.source} | "
-                f"{entry.message[:50]} |"
+        by_name: dict[str, list[dict]] = {}
+        for e in bad:
+            name = e.get("display_name", e.get("script", "?"))
+            by_name.setdefault(name, []).append(e)
+
+        crit = any(e["level"] == "CRITICAL" for e in bad)
+        header_icon = "💀" if crit else "🔴"
+        total = len(bad)
+
+        lines = [f"{header_icon} ✦ <b>{total} hal perlu diperhatikan.</b>  <code>{_esc(_now_short())}</code>", ""]
+        for name in sorted(by_name.keys()):
+            items = by_name[name]
+            worst = max(
+                items,
+                key=lambda e: _LEVEL_ORDER.index(e["level"]) if e["level"] in _LEVEL_ORDER else 0,
             )
-        return "\n".join(lines)
+            ico = _LEVEL_ICON.get(worst["level"], "🟡")
+            name_clean = _split_title(name)
+            lines.append(f"{ico} <b>{_esc(name_clean)}</b>")
+            rows = []
+            for e in items:
+                cell = e["judul"]
+                if e.get("saran"):
+                    cell += f"\n→ {_esc(e['saran'])}"
+                rows.append([_LEVEL_ICON.get(e["level"], "·"), cell])
+            content = _render_table(["", "Detail"], rows)
+            lines.append(f"<pre><tg-spoiler>{_esc(content)}</tg-spoiler></pre>")
+            lines.append("")
 
-    def clear(self):
-        """Clear all entries."""
-        self._entries.clear()
+        lines.append(f"<i><code>{_esc(_now_short())}</code></i>")
+        return "\n".join(lines).rstrip()
 
-
-# Global error log instance (used by monitoring scripts)
-_default_log = ErrorLog(log_file="data/errors.jsonl", min_level=ErrorLevel.WARNING)
-
-
-def log_error(
-    message: str,
-    level: ErrorLevel = ErrorLevel.ERROR,
-    source: str = "unknown",
-    details: Optional[dict] = None,
-):
-    """Convenience function to log to the default error log."""
-    _default_log.log(message=message, level=level, source=source, details=details)
-
-
-def get_error_summary(since: Optional[float] = None) -> str:
-    """Get a Telegram-formatted error summary."""
-    return _default_log.to_telegram_table(since=since)
+    @staticmethod
+    def clear_old(days: int = 14) -> None:
+        if not os.path.exists(ERROR_LOG_PATH):
+            return
+        try:
+            with open(ERROR_LOG_PATH) as f:
+                data = json.load(f)
+            cutoff = datetime.now().timestamp() - (days * 86400)
+            data = [
+                e for e in data
+                if datetime.strptime(e["ts"], "%Y-%m-%d %H:%M:%S").timestamp() > cutoff
+            ]
+            with open(ERROR_LOG_PATH, "w") as f:
+                json.dump(data, f, indent=2)
+        except (json.JSONDecodeError, OSError, ValueError, KeyError):
+            pass

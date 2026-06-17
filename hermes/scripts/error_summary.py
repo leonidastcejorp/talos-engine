@@ -1,126 +1,119 @@
 #!/usr/bin/env python3
-"""
-Talos Engine - Error Summary Aggregator
+"""📋 LogDesk — kumpulkan error dari monitor & report ke Telegram."""
+from __future__ import annotations
 
-Reads the error log (data/errors.jsonl) and produces a summary
-report grouped by source and severity. Outputs plain text and
-Telegram-formatted markdown.
-
-Usage:
-    python scripts/error_summary.py
-    python scripts/error_summary.py --since 24h
-    python scripts/error_summary.py --source monitor
-"""
-
-import argparse
+import json
+import os
 import sys
-import time
-from pathlib import Path
+from datetime import datetime, timedelta
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.error_log import ErrorLog, ErrorLevel, _default_log
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from telegram_ui import TelegramMessage
+from error_log import ErrorLog
 
-
-def parse_duration(dur: str) -> float:
-    """Parse a duration string like '24h', '7d', '60m' to seconds."""
-    dur = dur.strip().lower()
-    if dur.endswith("h"):
-        return float(dur[:-1]) * 3600
-    if dur.endswith("d"):
-        return float(dur[:-1]) * 86400
-    if dur.endswith("m"):
-        return float(dur[:-1]) * 60
-    return float(dur)
+STATE_FILE = os.path.expanduser("~/.hermes/scripts/.error_summary_state.json")
+CACHE_FILE = "/root/projects/bounty-output/error_summary_report.txt"
+LOGBACK_JAM = 24
+os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Talos Engine - Error Summary Aggregator"
-    )
-    parser.add_argument(
-        "--since", type=str, default="24h",
-        help="Time window (e.g., 24h, 7d, 60m). Default: 24h",
-    )
-    parser.add_argument(
-        "--source", type=str, default=None,
-        help="Filter by source (e.g., monitor, proxy_updater)",
-    )
-    parser.add_argument(
-        "--min-level", type=str, default="WARNING",
-        choices=["DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY"],
-        help="Minimum error level to show",
-    )
-    parser.add_argument(
-        "--format", type=str, default="text",
-        choices=["text", "telegram", "json"],
-        help="Output format",
-    )
-    parser.add_argument(
-        "--log-file", type=str, default="data/errors.jsonl",
-        help="Path to error log file",
-    )
-    args = parser.parse_args()
+def load_last_check() -> str | None:
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f).get("last_check_ts")
+    except Exception:
+        return None
 
-    # Load the error log
-    error_log = ErrorLog(log_file=args.log_file)
-    error_log.load_from_file()
 
-    since_seconds = parse_duration(args.since)
-    since_timestamp = time.time() - since_seconds
+def save_last_check() -> None:
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"last_check_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
+    except OSError:
+        pass
 
-    min_level = ErrorLevel[args.min_level.upper()]
 
-    # Get filtered entries
-    entries = error_log.get_entries(
-        min_level=min_level,
-        source=args.source,
-        since=since_timestamp,
-        limit=200,
-    )
+def write_cache(content: str | None) -> None:
+    try:
+        with open(CACHE_FILE, "w") as f:
+            if content:
+                f.write(content)
+            else:
+                f.write(f"✅ Error log bersih.\n{datetime.now().strftime('%H:%M')}")
+    except OSError:
+        pass
 
-    if args.format == "json":
-        import json
-        print(json.dumps(
-            [e.to_dict() for e in entries],
-            indent=2,
-        ))
-        return
 
-    if args.format == "telegram":
-        print(error_log.to_telegram_table(since=since_timestamp))
-        return
+def main(all_flag: bool = False, clear_flag: bool = False) -> int:
+    if clear_flag:
+        ErrorLog.clear_old(14)
+        print("✅ Error log dibersihkan (entry > 14 hari dihapus)")
+        return 0
 
-    # Text format
-    print(f"\n{'='*60}")
-    print(f"  TALOS ENGINE - Error Summary")
-    print(f"  Window: {args.since} | Min Level: {args.min_level}")
-    if args.source:
-        print(f"  Source filter: {args.source}")
-    print(f"{'='*60}\n")
-
+    entries = ErrorLog.get_recent(200)
     if not entries:
-        print("  ✅ No errors found in the selected window.")
-        return
+        write_cache(None)
+        return 0  # silent when nothing
 
-    # Summary by source
-    summary = error_log.summarize(since=since_timestamp)
-    if args.source:
-        summary = {args.source: summary.get(args.source, {})}
+    last_check = None if all_flag else load_last_check()
+    cutoff = last_check or (datetime.now() - timedelta(hours=LOGBACK_JAM)).strftime("%Y-%m-%d %H:%M:%S")
+    baru = entries if all_flag else [e for e in entries if e["ts"] >= cutoff]
 
-    print("  Summary by Source:")
-    for source, levels in sorted(summary.items()):
-        level_str = " | ".join(f"{lvl}: {cnt}" for lvl, cnt in sorted(levels.items()))
-        print(f"    [{source}] {level_str}")
+    crit = [e for e in baru if e["level"] == "CRITICAL"]
+    errs = [e for e in baru if e["level"] == "ERROR"]
+    warns = [e for e in baru if e["level"] == "WARNING"]
+    total = len(crit) + len(errs) + len(warns)
 
-    # Most recent errors
-    print(f"\n  Recent Errors (last {min(len(entries), 20)}):")
-    for entry in entries[-20:]:
-        import datetime
-        ts = datetime.datetime.fromtimestamp(entry.timestamp).strftime("%m-%d %H:%M:%S")
-        print(f"    {ts} {entry.emoji} [{entry.source}] {entry.message[:80]}")
+    if total == 0 and not all_flag:
+        write_cache(None)
+        return 0
+    if total == 0:
+        write_cache(None)
+        return 0
 
-    print(f"\n  Total: {len(entries)} errors in {args.since}")
+    level = "CRITICAL" if crit else "ERROR" if errs else "WARNING"
+    msg = TelegramMessage("LogDesk", "📋", level=level)
+    msg.add_text(f"<b>{total} hal</b> perlu diperhatikan\n")
+
+    by_name: dict[str, list[dict]] = {}
+    for e in crit + errs + warns:
+        name = e.get("display_name", e.get("script", "?"))
+        by_name.setdefault(name, []).append(e)
+
+    for name in sorted(by_name.keys()):
+        items = by_name[name]
+        worst = max(
+            items,
+            key=lambda e: ["INFO", "WARNING", "ERROR", "CRITICAL"].index(e["level"])
+            if e["level"] in ("INFO", "WARNING", "ERROR", "CRITICAL") else 0,
+        )
+        worst_ico = {"CRITICAL": "💀", "ERROR": "🔴", "WARNING": "🟡"}.get(worst["level"], "🟡")
+        msg.add_text(f"{worst_ico} <b>{name}</b>")
+        rows = []
+        for e in items:
+            ico = {"CRITICAL": "💀", "ERROR": "🔴", "WARNING": "🟡"}.get(e["level"], "·")
+            cell = e["judul"]
+            if e.get("saran"):
+                cell += f"\n💡 {e['saran']}"
+            rows.append([ico, cell])
+        msg.add_table(["", "Detail"], rows)
+        msg.add_blank()
+
+    result = msg.render()
+    save_last_check()
+    write_cache(result)
+    print(result)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    all_flag = "--all" in sys.argv
+    clear_flag = "--clear" in sys.argv
+    try:
+        sys.exit(main(all_flag, clear_flag))
+    except Exception:
+        print("🔴 Gagal bikin laporan error")
+        sys.exit(1)

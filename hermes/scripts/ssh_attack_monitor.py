@@ -1,189 +1,145 @@
 #!/usr/bin/env python3
-"""
-Talos Engine - SSH Attack Monitor
+"""🚪 PortGuard — deteksi percobaan hack SSH dari fail2ban log."""
+from __future__ import annotations
 
-Monitors authentication logs for SSH brute-force attempts
-and sends alerts when thresholds are exceeded.
-
-Usage:
-    python scripts/ssh_attack_monitor.py
-    python scripts/ssh_attack_monitor.py --threshold 20 --period 3600
-"""
-
-import argparse
 import json
 import os
-import re
+import subprocess
 import sys
-import time
-from collections import defaultdict
-from pathlib import Path
+from datetime import datetime, timedelta
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.error_log import log_error, ErrorLevel
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from telegram_ui import TelegramMessage
+from error_log import ErrorLog
 
-# Common auth log paths
-AUTH_LOG_PATHS = [
-    "/var/log/auth.log",
-    "/var/log/secure",
-]
-
-# Regex patterns for failed SSH attempts
-FAILED_PATTERNS = [
-    re.compile(r"Failed password for .* from (\d+\.\d+\.\d+\.\d+) port", re.I),
-    re.compile(r"authentication failure.*rhost=(\d+\.\d+\.\d+\.\d+)", re.I),
-    re.compile(r"Invalid user .* from (\d+\.\d+\.\d+\.\d+)", re.I),
-    re.compile(r"Connection closed by authenticating user .* (\d+\.\d+\.\d+\.\d+)", re.I),
-]
-
-STATE_FILE = Path("data/ssh_monitor_state.json")
-
-
-def find_auth_log() -> Path:
-    """Find the system auth log file."""
-    for path in AUTH_LOG_PATHS:
-        p = Path(path)
-        if p.exists():
-            return p
-    return None
-
-
-def parse_failed_attempts(log_path: Path, since: float) -> dict:
-    """
-    Parse auth log for failed SSH attempts since timestamp.
-    Returns dict of {ip: count}.
-    """
-    if not log_path or not log_path.exists():
-        return {}
-
-    attempts = defaultdict(int)
-    try:
-        with open(log_path, "r", errors="ignore") as f:
-            # Read last 5000 lines for efficiency
-            lines = []
-            for line in f:
-                lines.append(line)
-                if len(lines) > 5000:
-                    lines.pop(0)
-
-            for line in lines:
-                # Try to extract timestamp from syslog format
-                # e.g., "Jun 17 10:30:45"
-                for pattern in FAILED_PATTERNS:
-                    match = pattern.search(line)
-                    if match:
-                        ip = match.group(1)
-                        # Skip local/private IPs in count
-                        if not ip.startswith(("10.", "192.168.", "172.16.")):
-                            attempts[ip] += 1
-                        break
-    except Exception as e:
-        print(f"Log parse error: {e}")
-
-    return dict(attempts)
+STATE_FILE = os.path.expanduser("~/.hermes/scripts/.ssh_attack_state.json")
+AMBANG = 5
+F2B_LOG = "/var/log/fail2ban.log"
+log = ErrorLog("🚪 PortGuard")
 
 
 def load_state() -> dict:
-    """Load last monitoring state."""
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except json.JSONDecodeError:
-            pass
-    return {"last_position": 0, "last_check": 0, "known_ips": {}}
+    if not os.path.exists(STATE_FILE):
+        return {"known_ips": [], "last_notified_level": 999, "initialized": False}
+    try:
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+            d.setdefault("known_ips", [])
+            d.setdefault("last_notified_level", 999)
+            d.setdefault("initialized", False)
+            return d
+    except Exception:
+        return {"known_ips": [], "last_notified_level": 999, "initialized": False}
 
 
-def save_state(state: dict):
-    """Save monitoring state."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+def save_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
 
 
-def check_attacks(threshold: int = 10, period: int = 3600) -> dict:
-    """
-    Check for SSH attack patterns.
-    Returns summary dict with attack IPs.
-    """
-    log_path = find_auth_log()
-    if not log_path:
-        return {"error": "No auth log found", "attacks": []}
+def get_recent_bans() -> list[tuple[str, str]]:
+    if not os.path.exists(F2B_LOG):
+        return []
+    try:
+        r = subprocess.run(["grep", "NOTICE.*Ban", F2B_LOG], capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    raw = r.stdout.strip()
+    if not raw:
+        return []
+    cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    bans = []
+    for line in raw.split("\n"):
+        if not line.strip():
+            continue
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        ts = parts[0] + " " + parts[1].rstrip(",")
+        ip = parts[-1]
+        if ts >= cutoff:
+            bans.append((ts, ip))
+    return bans
 
-    now = time.time()
-    since = now - period
 
-    attempts = parse_failed_attempts(log_path, since)
+def main() -> int:
     state = load_state()
+    bans = get_recent_bans()
+    if not bans and not state.get("initialized"):
+        return 0  # silent when nothing
 
-    # Find IPs exceeding threshold
-    attacks = []
-    for ip, count in attempts.items():
-        if count >= threshold:
-            known = state.get("known_ips", {}).get(ip, 0)
-            attacks.append({
-                "ip": ip,
-                "count": count,
-                "previously_known": known > 0,
-            })
+    current_ips = [ip for _, ip in bans]
+    current_set = set(current_ips)
+    total_bans = len(bans)
+    new_ips = current_set - set(state["known_ips"])
+    new_count = len(new_ips)
 
-    # Update state
-    state["last_check"] = now
-    state["known_ips"] = {ip: max(attempts.get(ip, 0), state.get("known_ips", {}).get(ip, 0))
-                          for ip in set(list(attempts.keys()) + list(state.get("known_ips", {}).keys()))}
-    save_state(state)
+    # First run: initialize
+    if not state.get("initialized"):
+        save_state({
+            "known_ips": list(current_set),
+            "last_notified_level": new_count,
+            "initialized": True,
+            "last_checked": datetime.now().isoformat(),
+        })
+        msg = TelegramMessage("PortGuard", "🚪", level="OK")
+        msg.add_table(["Metric", "Value"], [
+            ["Status", "✅ Pemantauan dimulai"],
+            ["Percobaan 24j", str(total_bans)],
+            ["IP unik", str(len(current_set))],
+        ])
+        print(msg.render())
+        return 0
 
-    return {
-        "period_hours": round(period / 3600, 1),
-        "threshold": threshold,
-        "total_unique_ips": len(attempts),
-        "attacks": sorted(attacks, key=lambda a: a["count"], reverse=True),
-    }
+    # Save state
+    save_state({
+        "known_ips": list(current_set),
+        "last_notified_level": state["last_notified_level"],
+        "initialized": True,
+        "last_checked": datetime.now().isoformat(),
+    })
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Talos Engine - SSH Attack Monitor"
-    )
-    parser.add_argument(
-        "--threshold", type=int, default=10,
-        help="Alert threshold per IP (default: 10 attempts)",
-    )
-    parser.add_argument(
-        "--period", type=int, default=3600,
-        help="Analysis period in seconds (default: 3600 = 1 hour)",
-    )
-    args = parser.parse_args()
-
-    log_path = find_auth_log()
-    if not log_path:
-        print("⚠️ No auth log found at standard paths")
-        print(f"   Checked: {', '.join(AUTH_LOG_PATHS)}")
-        sys.exit(0)
-
-    result = check_attacks(args.threshold, args.period)
-
-    print(f"🔐 SSH Attack Monitor — {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"   Log file: {log_path}")
-    print(f"   Period: {result['period_hours']}h")
-    print(f"   Threshold: {result['threshold']} attempts/IP")
-    print(f"   Unique IPs seen: {result['total_unique_ips']}")
-
-    if result["attacks"]:
-        print(f"\n🚨 ATTACK DETECTED — {len(result['attacks'])} IPs exceed threshold:")
-        for attack in result["attacks"]:
-            tag = " (repeat)" if attack["previously_known"] else " (new)"
-            print(f"   • {attack['ip']}: {attack['count']} attempts{tag}")
-
-        log_error(
-            message=f"SSH attack detected: {len(result['attacks'])} IPs exceeding threshold",
-            level=ErrorLevel.ALERT,
-            source="ssh_attack_monitor",
-            details=result,
+    # Threshold check
+    if new_count > AMBANG and new_count > state["last_notified_level"]:
+        level = "ERROR" if new_count > 20 else "WARNING"
+        save_state({
+            "known_ips": list(current_set),
+            "last_notified_level": new_count,
+            "initialized": True,
+            "last_checked": datetime.now().isoformat(),
+        })
+        top_ips = sorted(new_ips)[:5]
+        msg = TelegramMessage("PortGuard", "🚪", level=level)
+        msg.add_alert(
+            level,
+            "Serangan SSH terdeteksi" if level == "ERROR" else "Percobaan SSH",
+            f"{new_count} IP baru, {total_bans}x percobaan, {len(current_set)} IP unik",
+            "Ganti port SSH / Cloudflare WAF" if level == "ERROR" else "fail2ban udah blokir"
         )
-        sys.exit(1)
-    else:
-        print("\n✅ No attacks detected")
-        sys.exit(0)
+        msg.add_table(["Detail", "Value"], [
+            ["IP baru (sample)", ", ".join(top_ips) + ("..." if new_count > 5 else "")],
+        ])
+        print(msg.render())
+        if level == "ERROR":
+            log.critical("SSH attack", f"{new_count} IP", "Ganti port")
+        else:
+            log.warning("SSH attempt", f"{new_count} IP", "OK")
+
+    log.persist()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception:
+        log.exception("PortGuard error", "")
+        report = log.format_report()
+        if report:
+            print(report)
+        log.persist()
+        sys.exit(1)

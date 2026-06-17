@@ -1,221 +1,174 @@
 #!/usr/bin/env python3
 """
-Talos Engine - Daily Report Generator
-
-Generates a comprehensive daily briefing covering:
-- Token usage from Hermes Agent state.db
-- System health snapshot
-- Error summary from error logs
-- Income pipeline statistics
-
-Outputs Telegram-formatted markdown for daily cron delivery.
-
-Usage:
-    python scripts/daily_report.py
-    python scripts/daily_report.py --webhook URL
+📊 Daily Briefing — ringkasan harian VPS (token, sistem, peluang).
+Format: RINGKAS, TABEL, bahasa Indonesia.
 """
+from __future__ import annotations
 
-import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
-import time
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timezone
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.error_log import _default_log, ErrorLevel
-try:
-    import psutil
-except ImportError:
-    psutil = None
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from telegram_ui import TelegramMessage, bar, fmt_num
+from error_log import ErrorLog
 
-# ─── Configuration ───────────────────────────────────────────────────────────
-HERMES_STATE_DB = os.path.expanduser("~/.hermes/state.db")
-ERROR_LOG_FILE = "data/errors.jsonl"
+HOME = os.path.expanduser("~")
+HERMES_DIR = os.path.join(HOME, ".hermes")
+STATE_DB = os.path.join(HERMES_DIR, "state.db")
+log = ErrorLog("📊 Daily Briefing")
 
 
-def get_token_usage(db_path: str) -> dict:
-    """Extract token usage from Hermes Agent state database."""
-    usage = {
-        "total_tokens": 0,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_requests": 0,
-        "total_cost_usd": 0.0,
-        "sessions_today": 0,
-    }
-
-    if not os.path.exists(db_path):
-        return usage
-
+def run(cmd: str, timeout: int = 15) -> str:
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        cursor = conn.cursor()
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except Exception:
+        return ""
 
-        # Get token totals from conversations table
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [row[0] for row in cursor.fetchall()]
 
-        # Try common table structures
-        today_start = datetime.now().replace(hour=0, minute=0, second=0).isoformat()
-
-        if "conversations" in tables:
-            try:
-                cursor.execute(
-                    "SELECT SUM(prompt_tokens), SUM(completion_tokens), COUNT(*) "
-                    "FROM conversations WHERE created_at >= ?",
-                    (today_start,),
-                )
-                row = cursor.fetchone()
-                if row and row[0]:
-                    usage["prompt_tokens"] = row[0] or 0
-                    usage["completion_tokens"] = row[1] or 0
-                    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-                    usage["total_requests"] = row[2] or 0
-            except sqlite3.OperationalError:
-                pass
-
-        if "messages" in tables:
-            try:
-                cursor.execute(
-                    "SELECT COUNT(*) FROM messages WHERE created_at >= ?",
-                    (today_start,),
-                )
-                row = cursor.fetchone()
-                if row:
-                    usage["sessions_today"] = row[0] or 0
-            except sqlite3.OperationalError:
-                pass
-
+def get_tokens() -> dict | None:
+    if not os.path.exists(STATE_DB):
+        return None
+    try:
+        conn = sqlite3.connect(STATE_DB)
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp()
+        yesterday = conn.execute(
+            """SELECT COUNT(*), COALESCE(SUM(input_tokens), 0),
+                      COALESCE(SUM(output_tokens), 0), COALESCE(SUM(estimated_cost_usd), 0),
+                      COALESCE(SUM(message_count), 0)
+               FROM sessions WHERE started_at > ?""",
+            (today_start - 86400,),
+        ).fetchone()
+        today = conn.execute(
+            """SELECT COUNT(*), COALESCE(SUM(input_tokens), 0),
+                      COALESCE(SUM(output_tokens), 0), COALESCE(SUM(estimated_cost_usd), 0)
+               FROM sessions WHERE started_at > ?""",
+            (today_start,),
+        ).fetchone()
         conn.close()
+        if yesterday[0] == 0:
+            return None
+        return {
+            "ses_24h": yesterday[0], "msg_24h": yesterday[4],
+            "in_24h": yesterday[1], "out_24h": yesterday[2], "cost_24h": yesterday[3],
+            "today_ses": today[0], "today_total": today[1] + today[2], "today_cost": today[3],
+        }
     except Exception as e:
-        print(f"DB read error (non-fatal): {e}")
+        log.warning("Gagal baca token", f"{e}", "Cek state.db")
+        return None
 
-    return usage
 
-
-def get_system_health() -> dict:
-    """Quick system health snapshot."""
-    if not psutil:
-        return {"available": False}
-
-    ram = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
-    cpu = psutil.cpu_percent(interval=1)
-    uptime = int(time.time() - psutil.boot_time())
-
+def get_sysinfo() -> dict:
     return {
-        "ram_pct": ram.percent,
-        "disk_pct": disk.percent,
-        "cpu_pct": cpu,
-        "uptime_hours": round(uptime / 3600, 1),
+        "uptime": run("uptime -p").replace("up ", "") or "?",
+        "ram_pct": int(run("free | awk '/Mem:/ {printf \"%d\", $3*100/$2}'") or 0),
+        "ram": run("free -h | awk '/Mem:/ {print $3\"/\"$2}'") or "?",
+        "disk_pct": int(run("df / | awk 'NR==2 {gsub(\"%\",\"\"); print $5}'") or 0),
+        "disk": run("df -h / | awk 'NR==2 {print $5\", \"$4\" free\"}'") or "?",
     }
 
 
-def get_error_stats() -> dict:
-    """Get error statistics from the error log."""
-    _default_log.load_from_file()
-    yesterday = (datetime.now() - timedelta(days=1)).timestamp()
-    summary = _default_log.summarize(since=yesterday)
-
-    total_errors = sum(
-        sum(levels.values()) for levels in summary.values()
-    )
-    return {
-        "total_errors_24h": total_errors,
-        "sources": summary,
-    }
-
-
-def format_daily_report(usage: dict, health: dict, errors: dict) -> str:
-    """Format the full daily briefing as Telegram Markdown."""
-    today = datetime.now().strftime("%A, %B %d %Y")
-    lines = [f"📋 *Talos Engine Daily Briefing*", f"📅 {today}", ""]
-
-    # ─── Token Usage ───────────────────────────────────────────────
-    lines.append("🤖 *Hermes Agent Usage*")
-    if usage["total_tokens"] > 0:
-        lines.append(f"• Tokens today: {usage['total_tokens']:,}")
-        lines.append(f"  - Prompt: {usage['prompt_tokens']:,}")
-        lines.append(f"  - Completion: {usage['completion_tokens']:,}")
-        lines.append(f"• Requests today: {usage['total_requests']}")
-        if usage["total_cost_usd"] > 0:
-            lines.append(f"• Est. cost: ${usage['total_cost_usd']:.3f}")
-    else:
-        lines.append("• No token data available (Hermes Agent may be offline)")
-    lines.append("")
-
-    # ─── System Health ─────────────────────────────────────────────
-    lines.append("🖥 *System Health*")
-    if health.get("available", True):
-        lines.append(f"• RAM: {health['ram_pct']:.1f}%")
-        lines.append(f"• Disk: {health['disk_pct']:.1f}%")
-        lines.append(f"• CPU: {health['cpu_pct']:.1f}%")
-        lines.append(f"• Uptime: {health['uptime_hours']}h")
-    else:
-        lines.append("• psutil not available")
-    lines.append("")
-
-    # ─── Error Summary ─────────────────────────────────────────────
-    lines.append("⚠️ *Errors (24h)*")
-    if errors["total_errors_24h"] > 0:
-        lines.append(f"• Total: {errors['total_errors_24h']}")
-        for source, counts in errors.get("sources", {}).items():
-            count_str = ", ".join(f"{lvl}: {n}" for lvl, n in counts.items())
-            lines.append(f"  - {source}: {count_str}")
-    else:
-        lines.append("• No errors — clean day! ✅")
-    lines.append("")
-
-    # ─── Footer ────────────────────────────────────────────────────
-    lines.append("---")
-    lines.append("🤖 _Talos Engine — Automation Framework_")
-
-    return "\n".join(lines)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Talos Engine - Daily Report Generator"
-    )
-    parser.add_argument(
-        "--webhook", type=str, default="",
-        help="Telegram webhook URL to send the report",
-    )
-    parser.add_argument(
-        "--state-db", type=str, default=HERMES_STATE_DB,
-        help="Path to Hermes Agent state.db",
-    )
-    args = parser.parse_args()
-
-    print("📋 Generating Talos Engine daily report...")
-
-    usage = get_token_usage(args.state_db)
-    health = get_system_health()
-    errors = get_error_stats()
-
-    report = format_daily_report(usage, health, errors)
-    print(report)
-    print()
-
-    if args.webhook:
-        # Simple Telegram send (same pattern as monitor.py)
-        import urllib.request
-        import urllib.parse
+def get_errors() -> str | None:
+    cache = "/root/projects/bounty-output/error_summary_report.txt"
+    if os.path.exists(cache):
         try:
-            data = urllib.parse.urlencode({
-                "chat_id": os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID"),
-                "text": report,
-                "parse_mode": "Markdown",
-            }).encode()
-            url = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN')}/sendMessage"
-            urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
-            print("✅ Report sent to Telegram")
-        except Exception as e:
-            print(f"❌ Telegram send failed: {e}")
+            with open(cache) as f:
+                content = f.read().strip()
+            if content and "Bersih" not in content:
+                return content
+        except OSError:
+            pass
+    return None
+
+
+def get_income() -> tuple[int, int] | None:
+    cache = "/root/projects/bounty-output/pipeline_report.txt"
+    if not os.path.exists(cache):
+        return None
+    try:
+        with open(cache) as f:
+            content = f.read()
+        return (content.count("[slavelabour]"), content.count("[Freelancer]"))
+    except OSError:
+        return None
+
+
+def main() -> int:
+    sys_info = get_sysinfo()
+    tokens = get_tokens()
+    errors = get_errors()
+    income = get_income()
+
+    msg = TelegramMessage("DailyBriefing", "📊", level="OK")
+
+    msg.add_table(["Sistem", "Status"], [
+        ["Uptime", sys_info["uptime"]],
+        ["RAM", f"`{bar(sys_info['ram_pct'])}` {sys_info['ram_pct']}% — {sys_info['ram']}"],
+        ["Disk", f"`{bar(sys_info['disk_pct'])}` {sys_info['disk_pct']}% — {sys_info['disk']}"],
+    ])
+
+    if tokens:
+        rows = [
+            ["Sessions 24j", str(tokens["ses_24h"])],
+            ["Messages 24j", str(tokens["msg_24h"])],
+            ["Input 24j", f"{fmt_num(tokens['in_24h'])} tok"],
+            ["Output 24j", f"{fmt_num(tokens['out_24h'])} tok"],
+            ["Total 24j", f"{fmt_num(tokens['in_24h'] + tokens['out_24h'])} tok"],
+            ["Cost 24j", f"${tokens['cost_24h']:.4f}"],
+        ]
+        if tokens["today_ses"] > 0:
+            rows.append(["Today", f"{tokens['today_ses']} ses · {fmt_num(tokens['today_total'])} tok"])
+        msg.add_table(["Token", "Value"], rows, caption="24 jam terakhir")
+
+    if income:
+        sl, fl = income
+        if sl + fl > 0:
+            msg.add_table(["Income", "Jumlah"], [
+                ["Reddit Gigs", str(sl)],
+                ["Freelancer", str(fl)],
+            ], caption="scan")
+
+    if errors:
+        msg.add_separator()
+        msg.add_text(f"⚠ <b>error log.</b>\n{errors[:400]}")
+    else:
+        msg.add_separator()
+        msg.add_text("✅ <b>error log</b> bersih, all good")
+
+    msg.add_table(["Airdrop", "Chain"], [
+        ["Hypernova (Prop Firm)", "Arbitrum"],
+        ["Interstate (Trading)", "Solana"],
+        ["DeepBook (Liquidity)", "Sui"],
+        ["ArcNova AI ($ROAM)", "BNB"],
+        ["Roam (DePIN $ROAM)", "Solana"],
+    ], caption="airdrop aktif")
+
+    msg.add_table(["Chain", "URL"], [
+        ["Sepolia ETH", "faucet.sepolia.dev"],
+        ["zkSync", "portal.zksync.io/faucet"],
+        ["Scroll", "scroll.io/faucet"],
+        ["Base", "base.org/faucet"],
+        ["Polygon", "faucet.polygon.technology"],
+    ], caption="faucet")
+
+    print(msg.render())
+    log.persist()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception:
+        log.exception("Daily Briefing error", "")
+        report = log.format_report()
+        if report:
+            print(report)
+        log.persist()
+        sys.exit(1)

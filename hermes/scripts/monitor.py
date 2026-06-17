@@ -1,213 +1,172 @@
 #!/usr/bin/env python3
-"""
-Talos Engine - Server Watchdog
+"""📡 VitalSign — Server Watchdog (RAM, Disk, CPU) untuk Telegram."""
+from __future__ import annotations
 
-Monitors RAM, Disk, CPU, and swap usage.
-Silent when healthy, sends alerts on threshold breaches.
-Outputs Telegram-formatted markdown tables.
-
-Usage:
-    python scripts/monitor.py                    # One-shot health check
-    python scripts/monitor.py --loop 300          # Continuous monitoring
-    python scripts/monitor.py --webhook URL       # With Telegram webhook
-"""
-
-import argparse
-import json
 import os
+import subprocess
 import sys
-import time
-from pathlib import Path
 
-# Add scripts/lib to path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.error_log import ErrorLog, ErrorLevel, log_error, get_error_summary
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from telegram_ui import TelegramMessage, bar
+from error_log import ErrorLog
 
-try:
-    import psutil
-except ImportError:
-    print("ERROR: psutil required. Install: pip install psutil")
-    sys.exit(1)
-
-# ─── Thresholds ──────────────────────────────────────────────────────────────
-RAM_WARN_PCT = 80       # Warning threshold (%)
-RAM_CRIT_PCT = 90       # Critical threshold (%)
-DISK_WARN_PCT = 80
-DISK_CRIT_PCT = 90
-CPU_WARN_PCT = 80
-CPU_CRIT_PCT = 95
-SWAP_WARN_PCT = 50
-SWAP_CRIT_PCT = 80
+log = ErrorLog("📡 VitalSign")
 
 
-def get_health_metrics() -> dict:
-    """Collect current system health metrics."""
-    ram = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
-    swap = psutil.swap_memory()
-    cpu = psutil.cpu_percent(interval=1)
-    load = psutil.getloadavg()
-    uptime = int(time.time() - psutil.boot_time())
-
-    return {
-        "timestamp": time.time(),
-        "ram": {
-            "total_gb": round(ram.total / (1024**3), 2),
-            "used_gb": round(ram.used / (1024**3), 2),
-            "percent": ram.percent,
-            "status": _level(ram.percent, RAM_WARN_PCT, RAM_CRIT_PCT),
-        },
-        "disk": {
-            "total_gb": round(disk.total / (1024**3), 2),
-            "used_gb": round(disk.used / (1024**3), 2),
-            "percent": disk.percent,
-            "status": _level(disk.percent, DISK_WARN_PCT, DISK_CRIT_PCT),
-        },
-        "cpu": {
-            "percent": cpu,
-            "cores": psutil.cpu_count(),
-            "status": _level(cpu, CPU_WARN_PCT, CPU_CRIT_PCT),
-        },
-        "swap": {
-            "total_gb": round(swap.total / (1024**3), 2),
-            "used_gb": round(swap.used / (1024**3), 2),
-            "percent": swap.percent,
-            "status": _level(swap.percent, SWAP_WARN_PCT, SWAP_CRIT_PCT),
-        },
-        "load": {
-            "1min": load[0],
-            "5min": load[1],
-            "15min": load[2],
-        },
-        "uptime_hours": round(uptime / 3600, 1),
-    }
-
-
-def _level(value: float, warn: float, crit: float) -> str:
-    if value >= crit:
-        return "🔴 CRIT"
-    if value >= warn:
-        return "🟡 WARN"
-    return "🟢 OK"
-
-
-def format_telegram(m: dict) -> str:
-    """Format health metrics as a Telegram MarkdownV2 table."""
-    lines = ["🖥 *Server Health Report*", ""]
-    lines.append(f"📅 `{time.strftime('%Y-%m-%d %H:%M:%S')}`")
-    lines.append(f"⏱ Uptime: {m['uptime_hours']}h")
-    lines.append("")
-
-    # RAM
-    ram = m["ram"]
-    lines.append(f"🧠 *RAM*: {ram['percent']:.1f}% ({ram['used_gb']} / {ram['total_gb']} GB) {ram['status']}")
-
-    # Disk
-    disk = m["disk"]
-    lines.append(f"💾 *Disk*: {disk['percent']:.1f}% ({disk['used_gb']} / {disk['total_gb']} GB) {disk['status']}")
-
-    # CPU
-    cpu = m["cpu"]
-    lines.append(f"⚙️ *CPU*: {cpu['percent']:.1f}% ({cpu['cores']} cores) {cpu['status']}")
-
-    # Swap
-    swap = m["swap"]
-    if swap["total_gb"] > 0:
-        lines.append(f"🔄 *Swap*: {swap['percent']:.1f}% ({swap['used_gb']} / {swap['total_gb']} GB) {swap['status']}")
-
-    # Load
-    load = m["load"]
-    lines.append(f"📊 *Load*: {load['1min']:.2f} / {load['5min']:.2f} / {load['15min']:.2f}")
-
-    return "\n".join(lines)
-
-
-def send_telegram(message: str, webhook_url: str):
-    """Send a message via Telegram bot API."""
-    import urllib.request
-    import urllib.parse
-
+def run(cmd: str, timeout: int = 15) -> tuple[str, bool]:
     try:
-        data = urllib.parse.urlencode({
-            "chat_id": os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID"),
-            "text": message,
-            "parse_mode": "Markdown",
-        }).encode()
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN')}/sendMessage",
-            data=data,
-        )
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        print(f"Telegram send failed: {e}")
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.returncode == 0
+    except subprocess.TimeoutExpired:
+        return "", False
+    except FileNotFoundError:
+        log.error("Perintah gak ada", f"`{cmd.split()[0]}` gak ada", "Cek PATH")
+        return "", False
+    except OSError as e:
+        log.error("Gagal jalanin", f"{e}", "Cek permission")
+        return "", False
 
 
-def check_and_alert(metrics: dict, webhook_url: str = None, silent_ok: bool = True):
-    """Check thresholds and send alerts if needed."""
-    has_issue = False
-    alerts = []
-
-    for name, data in metrics.items():
-        if name in ("timestamp", "uptime_hours", "load"):
-            continue
-        if data.get("status", "").startswith("🔴"):
-            has_issue = True
-            alerts.append(f"CRITICAL: {name.upper()} at {data['percent']:.1f}%")
-
-    if has_issue:
-        log_error(
-            message="; ".join(alerts),
-            level=ErrorLevel.CRITICAL,
-            source="monitor",
-            details=metrics,
-        )
-        if webhook_url:
-            msg = format_telegram(metrics)
-            msg += "\n\n⚠️ *Thresholds Breached!*"
-            send_telegram(msg, webhook_url)
-
-    # Print to stdout (for cron output)
-    if not silent_ok or has_issue:
-        print(format_telegram(metrics))
+def parse_free() -> dict | None:
+    out, ok = run("free -m")
+    if not ok or not out:
+        return None
+    try:
+        mem = [c for c in out.split("\n") if c.startswith("Mem:")][0].split()
+        total, used = int(mem[1]), int(mem[2])
+        avail = int(mem[6]) if len(mem) > 6 else total - used
+        return {
+            "used_gb": used / 1024,
+            "total_gb": total / 1024,
+            "pct": int(used * 100 / total) if total else 0,
+        }
+    except (IndexError, ValueError, ZeroDivisionError):
+        return None
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Talos Engine - Server Watchdog"
-    )
-    parser.add_argument(
-        "--loop", type=int, default=0,
-        help="Run continuously with N second interval",
-    )
-    parser.add_argument(
-        "--webhook", type=str, default="",
-        help="Telegram webhook URL for alerts",
-    )
-    parser.add_argument(
-        "--silent", action="store_true", default=True,
-        help="Only output when issues detected",
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Always output health report",
-    )
-    args = parser.parse_args()
+def parse_df() -> dict | None:
+    out, ok = run("df -h / | tail -1")
+    if not ok or not out:
+        return None
+    parts = out.split()
+    try:
+        return {
+            "used": parts[2],
+            "total": parts[1],
+            "pct": int(parts[4].rstrip("%")),
+        }
+    except (IndexError, ValueError):
+        return None
 
-    silent_ok = args.silent and not args.verbose
 
-    if args.loop:
-        print(f"🖥 Talos Engine Watchdog started (interval={args.loop}s)")
-        try:
-            while True:
-                metrics = get_health_metrics()
-                check_and_alert(metrics, args.webhook, silent_ok)
-                time.sleep(args.loop)
-        except KeyboardInterrupt:
-            print("\nWatchdog stopped.")
-    else:
-        metrics = get_health_metrics()
-        check_and_alert(metrics, args.webhook, silent_ok)
+def parse_load() -> dict | None:
+    out, _ = run("uptime | grep -oP 'load average:.*' | cut -d: -f2")
+    if not out:
+        return None
+    vals = [float(x) for x in out.replace(",", "").split() if x.replace(".", "").isdigit()]
+    if not vals:
+        return None
+    cores_out, _ = run("nproc")
+    cores = int(cores_out) if cores_out and cores_out.isdigit() else 2
+    load = vals[0]
+    return {"load": load, "cores": cores, "util": (load / cores) * 100}
+
+
+def ram_level(pct: int) -> str:
+    if pct >= 92: return "CRITICAL"
+    if pct >= 82: return "ERROR"
+    if pct >= 70: return "WARNING"
+    return "OK"
+
+
+def disk_level(pct: int) -> str:
+    if pct >= 93: return "CRITICAL"
+    if pct >= 88: return "ERROR"
+    if pct >= 78: return "WARNING"
+    return "OK"
+
+
+def cpu_level(util: float) -> str:
+    if util >= 150: return "CRITICAL"
+    if util >= 100: return "ERROR"
+    if util >= 70:  return "WARNING"
+    return "OK"
+
+
+def worst_level(*levels: str) -> str:
+    order = ["OK", "WARNING", "ERROR", "CRITICAL"]
+    return max(levels, key=lambda l: order.index(l)) if levels else "OK"
+
+
+def main() -> int:
+    ram = parse_free()
+    disk = parse_df()
+    cpu = parse_load()
+
+    levels = []
+    if ram: levels.append(ram_level(ram["pct"]))
+    if disk: levels.append(disk_level(disk["pct"]))
+    if cpu: levels.append(cpu_level(cpu["util"]))
+    level = worst_level(*levels) if levels else "OK"
+
+    msg = TelegramMessage("VitalSign", "📡", level=level)
+
+    # Ringkas: gabung bar + value di 1 cell
+    rows = []
+    if ram:
+        rows.append(["RAM", f"`{bar(ram['pct'])}` {ram['pct']}% — {ram['used_gb']:.1f}G/{ram['total_gb']:.1f}G"])
+    if disk:
+        rows.append(["Disk", f"`{bar(disk['pct'])}` {disk['pct']}% — {disk['used']}/{disk['total']}"])
+    if cpu:
+        rows.append(["CPU", f"`{bar(min(cpu['util'], 100))}` {cpu['util']:.0f}% — load {cpu['load']:.2f}/{cpu['cores']}c"])
+    if rows:
+        msg.add_table(["Metric", "Status"], rows)
+
+    # Alert RINGKAS (cuma kalau ada masalah)
+    if ram and ram_level(ram["pct"]) != "OK":
+        lvl = ram_level(ram["pct"])
+        avail_gb = ram["total_gb"] - ram["used_gb"]
+        if lvl == "CRITICAL":
+            msg.add_alert("CRITICAL", "RAM kritis", f"{ram['pct']}%, sisa {avail_gb:.1f}G", "Matikan program berat")
+            log.critical("RAM habis", f"{ram['pct']}%", "Matikan program")
+        elif lvl == "ERROR":
+            msg.add_alert("ERROR", "RAM bahaya", f"{ram['pct']}%, sisa {avail_gb:.1f}G", "Bersihin cache: drop_caches")
+        else:
+            msg.add_alert("WARNING", "RAM tinggi", f"{ram['pct']}%, sisa {avail_gb:.1f}G", "Pantau, restart Hermes kalo naik")
+
+    if disk and disk_level(disk["pct"]) != "OK":
+        lvl = disk_level(disk["pct"])
+        sisa = 40 * (100 - disk["pct"]) / 100
+        if lvl == "CRITICAL":
+            msg.add_alert("CRITICAL", "Disk penuh", f"{disk['pct']}%, sisa ~{sisa:.1f}G", "Hapus log: journalctl --vacuum-size=500M")
+            log.critical("Disk penuh", f"{disk['pct']}%", "Hapus log")
+        elif lvl == "ERROR":
+            msg.add_alert("ERROR", "Disk bahaya", f"{disk['pct']}% ({disk['used']}/{disk['total']})", "apt clean & hapus log")
+        else:
+            msg.add_alert("WARNING", "Disk naik", f"{disk['pct']}% ({disk['used']}/{disk['total']})", "Pantau, cleanup dalam 1-2 minggu")
+
+    if cpu and cpu_level(cpu["util"]) != "OK":
+        lvl = cpu_level(cpu["util"])
+        if lvl == "CRITICAL":
+            msg.add_alert("CRITICAL", "CPU overload", f"load {cpu['load']:.2f}/{cpu['cores']}c", "Cek htop, matikan yg boros")
+            log.critical("CPU overload", f"{cpu['load']:.2f}", "Cek htop")
+        elif lvl == "ERROR":
+            msg.add_alert("ERROR", "CPU penuh", f"load {cpu['load']:.2f}/{cpu['cores']}c", "Cek ps aux --sort=-%cpu")
+        else:
+            msg.add_alert("WARNING", "CPU tinggi", f"load {cpu['load']:.2f}/{cpu['cores']}c ({cpu['util']:.0f}%)", "Jangan spawn task baru dulu")
+
+    print(msg.render())
+    log.persist()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception:
+        log.exception("VitalSign error", "Coba ulang")
+        report = log.format_report()
+        if report:
+            print(report)
+        log.persist()
+        sys.exit(1)

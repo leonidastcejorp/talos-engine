@@ -1,277 +1,152 @@
 #!/usr/bin/env python3
 """
-Talos Engine - Income Pipeline Scraper
-
-Scrapes income opportunities from:
-- Reddit (r/forhire, r/slavelabour, r/Jobs4Bitcoins)
-- Freelancer.com (public listings)
-
-Outputs formatted opportunities for review.
-
-Usage:
-    python scripts/income_pipeline.py
-    python scripts/income_pipeline.py --sources reddit freelancer
-    python scripts/income_pipeline.py --min-budget 50
+💰 Cuan Feed — cari gigs & peluang cuan dari Reddit, Freelancer, DeFi.
+Output: silent kalo gak ada yang menarik. Alert kalo ada high-value gig.
 """
+from __future__ import annotations
 
-import argparse
-import asyncio
 import json
+import os
 import re
 import sys
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Optional
-from urllib.parse import quote
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.error_log import log_error, ErrorLevel
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from telegram_ui import TelegramMessage, fmt_num
+from error_log import ErrorLog
 
-# ─── Data Models ────────────────────────────────────────────────────────────
+CACHE_DIR = "/root/projects/bounty-output"
+CACHE_FILE = f"{CACHE_DIR}/pipeline_report.txt"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-
-@dataclass
-class Opportunity:
-    """An income opportunity."""
-    title: str
-    url: str
-    source: str
-    budget: Optional[str] = None
-    description: str = ""
-    posted: str = ""
-    score: int = 0  # Reddit upvotes or relevance score
-
-    @property
-    def display_line(self) -> str:
-        budget_str = f" [{self.budget}]" if self.budget else ""
-        return f"• {self.source.upper()}: {self.title}{budget_str}\n  {self.url}"
+log = ErrorLog("💰 Cuan Feed")
+RESULTS: list[tuple[str, str, str]] = []
 
 
-# ─── Reddit Scraper ─────────────────────────────────────────────────────────
+def tulis(cat: str, msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M")
+    RESULTS.append((ts, cat, msg))
 
 
-REDDIT_SUBREDDITS = [
-    "forhire",
-    "slavelabour",
-    "Jobs4Bitcoins",
-    "freelance_forhire",
-    "jobbit",
-]
-
-REDDIT_SEARCH_TERMS = [
-    "python developer",
-    "web scraping",
-    "automation",
-    "bot development",
-    "data entry",
-    "virtual assistant",
-    "script",
-    "API integration",
-]
+def fetch(url: str, timeout: int = 20) -> str | None:
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 BREACH-bot/1.0"
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        log.warning(f"HTTP {e.code} di {url[:40]}", "Mungkin situs down", "Cek manual")
+        return None
+    except Exception as e:
+        log.warning(f"Gagal fetch {url[:40]}", f"{type(e).__name__}", "Cek koneksi")
+        return None
 
 
-def fetch_reddit_opportunities(subreddits: List[str] = None) -> List[Opportunity]:
-    """Scrape Reddit for income opportunities using public JSON API."""
-    opportunities = []
-    subs = subreddits or REDDIT_SUBREDDITS
-
-    import urllib.request
-
-    for sub in subs:
-        try:
-            url = f"https://www.reddit.com/r/{sub}/new.json?limit=25"
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Talos-Engine/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-
-            for post in data.get("data", {}).get("children", []):
-                post_data = post["data"]
-                title = post_data.get("title", "")
-                post_url = f"https://reddit.com{post_data.get('permalink', '')}"
-                description = post_data.get("selftext", "")[:300]
-                score = post_data.get("score", 0)
-
-                # Skip stickied posts
-                if post_data.get("stickied"):
-                    continue
-
-                # Look for budget patterns
-                budget = None
-                budget_match = re.search(
-                    r'\$(\d+[,\d]*(?:\.\d{2})?)', title + description
-                )
-                if budget_match:
-                    budget = f"${budget_match.group(1)}"
-
-                # Also check for "hiring" tag
-                if post_data.get("link_flair_text") == "Hiring":
-                    budget = budget or "[HIRING]"
-
-                opportunities.append(Opportunity(
-                    title=title[:150],
-                    url=post_url,
-                    source=f"reddit/r/{sub}",
-                    budget=budget,
-                    description=description,
-                    score=score,
-                ))
-
-        except Exception as e:
-            log_error(
-                message=f"Reddit scrape failed for r/{sub}: {e}",
-                level=ErrorLevel.WARNING,
-                source="income_pipeline",
-            )
-
-    # Sort by score (relevance)
-    opportunities.sort(key=lambda o: o.score, reverse=True)
-    return opportunities[:30]
+def cek_reddit(sub: str, query: str) -> int:
+    url = f"https://old.reddit.com/r/{sub}/search.rss?q={urllib.parse.quote(query)}&sort=new&restrict_sr=on&limit=15"
+    html = fetch(url)
+    if not html:
+        return 0
+    entries = re.findall(r"<entry>(.*?)</entry>", html, re.DOTALL)
+    if not entries:
+        return 0
+    matches = 0
+    keywords = ["$", "usd", "pay", "paypal", "btc", "eth", "crypto", "task", "job", "hire"]
+    for e in entries[:8]:
+        title_m = re.search(r"<title>(.*?)</title>", e, re.DOTALL)
+        if not title_m:
+            continue
+        title = title_m.group(1).strip()
+        title = title.replace("&amp;", "&").replace("&#x27;", "'").replace("&quot;", '"')
+        if any(kw in title.lower() for kw in keywords):
+            link_m = re.search(r'<link[^>]*href="([^"]+)"', e) or re.search(r"<link>(.*?)</link>", e)
+            link = link_m.group(1).strip() if link_m else ""
+            tulis(sub, f"{title[:80]}|{link}")
+            matches += 1
+    return matches
 
 
-# ─── Freelancer Scraper ─────────────────────────────────────────────────────
+def cek_freelancer() -> int:
+    data = fetch("https://www.freelancer.com/api/projects/0.1/projects/active/?limit=5", timeout=15)
+    if not data:
+        return 0
+    try:
+        j = json.loads(data)
+    except json.JSONDecodeError:
+        return 0
+    if j.get("status") != "success":
+        return 0
+    projects = j.get("result", {}).get("projects", [])
+    count = 0
+    for p in projects[:5]:
+        title = (p.get("title", "Untitled") or "Untitled")[:60]
+        budget = p.get("budget", {}) or {}
+        amount = budget.get("minimum", "?")
+        currency = (budget.get("currency", {}) or {}).get("code", "$")
+        tulis("Freelancer", f"{title}|{currency}{amount}")
+        count += 1
+    return count
 
 
-def fetch_freelancer_opportunities() -> List[Opportunity]:
-    """Scrape Freelancer.com for relevant projects."""
-    opportunities = []
-    import urllib.request
-
-    keywords = [
-        "python", "automation", "web scraping", "bot",
-        "script", "data extraction",
-    ]
-
-    for keyword in keywords:
-        try:
-            url = (
-                f"https://www.freelancer.com/api/projects/0.1/projects/active/"
-                f"?query={quote(keyword)}&limit=10&compact=true"
-            )
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Talos-Engine/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-
-            for project in data.get("result", {}).get("projects", []):
-                budget = None
-                if project.get("budget", {}).get("minimum"):
-                    min_b = project["budget"]["minimum"]
-                    max_b = project["budget"].get("maximum", min_b)
-                    currency = project.get("currency", {}).get("code", "USD")
-                    budget = f"{currency} {min_b}-{max_b}"
-
-                opportunities.append(Opportunity(
-                    title=project.get("title", "")[:150],
-                    url=f"https://www.freelancer.com/projects/"
-                        f"{project.get('seo_url', '')}",
-                    source="freelancer",
-                    budget=budget,
-                    description=project.get("description", "")[:300],
-                    score=project.get("bid_count", 0),
-                ))
-
-        except Exception as e:
-            log_error(
-                message=f"Freelancer scrape failed for '{keyword}': {e}",
-                level=ErrorLevel.WARNING,
-                source="income_pipeline",
-            )
-
-    opportunities.sort(key=lambda o: o.score, reverse=True)
-    return opportunities[:20]
+def write_cache() -> None:
+    try:
+        with open(CACHE_FILE, "w") as f:
+            f.write(f"💰 Income Pipeline — {datetime.now().isoformat()}\n")
+            f.write("=" * 52 + "\n")
+            for ts, cat, msg in RESULTS:
+                f.write(f"[{ts}] [{cat}] {msg}\n")
+    except OSError:
+        log.error("Gagal simpan cache", "Disk issue", "Cek disk")
 
 
-# ─── Main ───────────────────────────────────────────────────────────────────
+def main() -> int:
+    try:
+        cek_reddit("slavelabour", "paypal crypto usd bitcoin")
+        cek_reddit("beermoney", "paypal free crypto")
+        cek_reddit("forhire", "paypal usd")
+        cek_freelancer()
+    except Exception:
+        log.exception("Pipeline error", "Cek koneksi")
 
+    write_cache()
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Talos Engine - Income Pipeline Scraper"
-    )
-    parser.add_argument(
-        "--sources", nargs="+", default=["reddit", "freelancer"],
-        choices=["reddit", "freelancer"],
-        help="Sources to scrape (default: both)",
-    )
-    parser.add_argument(
-        "--min-budget", type=int, default=0,
-        help="Minimum budget/amount filter (e.g., 50 for $50+)",
-    )
-    parser.add_argument(
-        "--output", type=str, default="",
-        help="Save results to JSON file",
-    )
-    args = parser.parse_args()
+    # High-value filter: $50+ gigs
+    high_val = []
+    for ts, cat, msg in RESULTS:
+        if re.search(r'\$[5-9]\d{2,}|\$\d{4,}', msg):
+            title_part = msg.split("|")[0] if "|" in msg else msg
+            link_part = msg.split("|")[1] if "|" in msg else ""
+            high_val.append((cat, title_part[:60], link_part, ts))
 
-    all_opportunities = []
+    if not high_val and not log.ada_masalah():
+        return 0
 
-    if "reddit" in args.sources:
-        print("🔍 Scanning Reddit...")
-        reddit_opps = fetch_reddit_opportunities()
-        all_opportunities.extend(reddit_opps)
-        print(f"   Found {len(reddit_opps)} opportunities")
+    if high_val:
+        msg = TelegramMessage("CuanFeed", "💰", level="OK")
+        msg.add_text("<b>HIGH-VALUE GIG TERDETEKSI!</b>\n")
+        rows = [[cat, title, link[:50] if link else "—", ts] for cat, title, link, ts in high_val[:6]]
+        msg.add_table(["Kategori", "Detail", "Link", "Jam"], rows)
+        print(msg.render())
+    elif log.ada_masalah():
+        report = log.format_report()
+        if report:
+            print(report)
 
-    if "freelancer" in args.sources:
-        print("🔍 Scanning Freelancer...")
-        freelance_opps = fetch_freelancer_opportunities()
-        all_opportunities.extend(freelance_opps)
-        print(f"   Found {len(freelance_opps)} opportunities")
-
-    # Filter by budget
-    if args.min_budget > 0:
-        all_opportunities = [
-            o for o in all_opportunities
-            if o.budget and _budget_value(o.budget) >= args.min_budget
-        ]
-        print(f"   After budget filter (≥${args.min_budget}): {len(all_opportunities)}")
-
-    # Sort by score
-    all_opportunities.sort(key=lambda o: o.score, reverse=True)
-
-    # Display
-    print(f"\n{'='*60}")
-    print(f"  💰 Income Pipeline — {len(all_opportunities)} Opportunities")
-    print(f"{'='*60}\n")
-
-    if not all_opportunities:
-        print("  No opportunities found matching your criteria.")
-        return
-
-    for i, opp in enumerate(all_opportunities[:30], 1):
-        print(f"{i:2d}. {opp.display_line}")
-
-    # Save to file if requested
-    if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        data = [
-            {
-                "title": o.title,
-                "url": o.url,
-                "source": o.source,
-                "budget": o.budget,
-                "description": o.description,
-                "score": o.score,
-            }
-            for o in all_opportunities
-        ]
-        output_path.write_text(json.dumps(data, indent=2))
-        print(f"\n📁 Saved to {args.output}")
-
-
-def _budget_value(budget_str: str) -> float:
-    """Extract numeric value from budget string."""
-    match = re.search(r'[\d,]+(?:\.\d{2})?', budget_str.replace(",", ""))
-    if match:
-        return float(match.group())
+    log.persist()
     return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception:
+        log.exception("Cuan Feed error", "")
+        report = log.format_report()
+        if report:
+            print(report)
+        log.persist()
+        sys.exit(1)

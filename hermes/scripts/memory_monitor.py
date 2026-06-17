@@ -1,116 +1,155 @@
 #!/usr/bin/env python3
-"""
-Talos Engine - Memory Monitor
+"""📈 MemStat — Memory & OOM Monitor untuk Telegram."""
+from __future__ import annotations
 
-Hourly RAM check with threshold-based alerts.
-Designed for cron: 0 * * * * /path/to/memory_monitor.py
-
-Usage:
-    python scripts/memory_monitor.py
-    python scripts/memory_monitor.py --threshold 85
-"""
-
-import argparse
+import json
 import os
+import subprocess
 import sys
-import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.error_log import log_error, ErrorLevel
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from telegram_ui import TelegramMessage, bar
+from error_log import ErrorLog
 
-try:
-    import psutil
-except ImportError:
-    print("ERROR: psutil required. Install: pip install psutil")
-    sys.exit(1)
+STATE_FILE = os.path.expanduser("~/.hermes/scripts/.memory_state.json")
+SWAP_WARN_MB = 500
+MEM_WARN_PCT = 90
 
-DEFAULT_THRESHOLD = 85  # Alert if RAM exceeds this %
+log = ErrorLog("📈 MemStat")
 
 
-def check_memory(threshold: int = DEFAULT_THRESHOLD) -> bool:
-    """
-    Check RAM usage against threshold.
-    Returns True if healthy, False if threshold breached.
-    """
-    ram = psutil.virtual_memory()
-    swap = psutil.swap_memory()
-
-    # RAM check
-    if ram.percent >= threshold:
-        process = _top_process()
-        log_error(
-            message=f"RAM at {ram.percent:.1f}% — threshold {threshold}%",
-            level=ErrorLevel.CRITICAL,
-            source="memory_monitor",
-            details={
-                "ram_pct": ram.percent,
-                "ram_used_gb": round(ram.used / (1024**3), 2),
-                "ram_total_gb": round(ram.total / (1024**3), 2),
-                "top_process": process,
-            },
-        )
-        print(f"🚨 CRITICAL: RAM at {ram.percent:.1f}%")
-        if process:
-            print(f"   Top process: {process}")
-        return False
-
-    # Swap check
-    if swap.percent >= 50:
-        log_error(
-            message=f"Swap at {swap.percent:.1f}% — heavy swapping detected",
-            level=ErrorLevel.WARNING,
-            source="memory_monitor",
-            details={"swap_pct": swap.percent},
-        )
-        print(f"⚠️ WARNING: Swap at {swap.percent:.1f}%")
-        return False
-
-    return True
-
-
-def _top_process() -> str:
-    """Get the highest-memory process name."""
+def run(cmd: list[str], timeout: int = 10) -> tuple[str, bool]:
     try:
-        processes = []
-        for proc in psutil.process_iter(["name", "memory_percent"]):
-            try:
-                processes.append(proc.info)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        processes.sort(key=lambda p: p["memory_percent"] or 0, reverse=True)
-        if processes:
-            top = processes[0]
-            return f"{top['name']} ({top['memory_percent']:.1f}%)"
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.returncode == 0
     except Exception:
+        return "", False
+
+
+def parse_mem() -> dict | None:
+    raw, ok = run(["free", "-m"])
+    if not ok or not raw:
+        return None
+    try:
+        mem = [c for c in raw.split("\n") if c.startswith("Mem:")][0].split()
+        swap = [c for c in raw.split("\n") if c.startswith("Swap:")][0].split()
+        return {
+            "used": int(mem[2]), "total": int(mem[1]),
+            "avail": int(mem[6]) if len(mem) > 6 else int(mem[1]) - int(mem[2]),
+            "pct": int(int(mem[2]) * 100 / int(mem[1])),
+            "swap_used": int(swap[2]), "swap_total": int(swap[1]),
+            "swap_pct": int(int(swap[2]) * 100 / int(swap[1])) if int(swap[1]) else 0,
+        }
+    except (IndexError, ValueError, ZeroDivisionError):
+        return None
+
+
+def check_oom() -> int:
+    raw, ok = run(["dmesg", "--level=emerg,alert,crit,err"])
+    if not ok:
+        return 0
+    return sum(1 for line in (raw or "").split("\n") if "oom" in line.lower() or "out of memory" in line.lower())
+
+
+def load_state() -> dict:
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except OSError:
         pass
-    return ""
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Talos Engine - Memory Monitor"
-    )
-    parser.add_argument(
-        "--threshold", type=int, default=DEFAULT_THRESHOLD,
-        help=f"RAM usage alert threshold in %% (default: {DEFAULT_THRESHOLD})",
-    )
-    args = parser.parse_args()
+def main() -> int:
+    mem = parse_mem()
+    oom_count = check_oom()
+    prev = load_state()
+    alerts: list[dict] = []
 
-    ram = psutil.virtual_memory()
-    swap = psutil.swap_memory()
+    if mem:
+        swap_used, mem_pct, mem_avail = mem["swap_used"], mem["pct"], mem["avail"]
+        swap_total, swap_pct = mem["swap_total"], mem["swap_pct"]
 
-    print(f"🧠 Memory Check — {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"   RAM:  {ram.percent:.1f}% ({ram.used / 1024**3:.1f} / {ram.total / 1024**3:.1f} GB)")
-    print(f"   Swap: {swap.percent:.1f}% ({swap.used / 1024**3:.1f} / {swap.total / 1024**3:.1f} GB)")
+        if swap_used > SWAP_WARN_MB and not prev.get("swap_warned", False):
+            alerts.append({
+                "level": "WARNING", "title": "Swap penuh",
+                "detail": f"{swap_used}MB/{swap_total}MB ({swap_pct}%), RAM {mem_pct}%",
+                "saran": "Tutup app boros atau upgrade RAM",
+            })
+        prev["swap_warned"] = swap_used > SWAP_WARN_MB
 
-    healthy = check_memory(args.threshold)
+        if mem_pct > MEM_WARN_PCT and not prev.get("ram_critical_warned", False):
+            alerts.append({
+                "level": "ERROR", "title": "RAM kritis",
+                "detail": f"{mem_pct}%, sisa {mem_avail}MB",
+                "saran": "Tutup program / matikan service",
+            })
+        prev["ram_critical_warned"] = mem_pct > MEM_WARN_PCT
 
-    if healthy:
-        print("   ✅ Memory OK")
+        if oom_count > 0 and oom_count > prev.get("oom_count", 0):
+            alerts.append({
+                "level": "CRITICAL", "title": "OOM Killer aktif",
+                "detail": f"Sistem bunuh program {oom_count}x",
+                "saran": "dmesg | grep -i oom",
+            })
+        prev["oom_count"] = oom_count
 
-    sys.exit(0 if healthy else 1)
+        if prev.get("swap_warned_prev", False) and swap_used <= SWAP_WARN_MB:
+            alerts.append({
+                "level": "INFO", "title": "Swap normal",
+                "detail": f"Turun ke {swap_used}MB",
+            })
+        prev["swap_warned_prev"] = swap_used > SWAP_WARN_MB
+
+        if prev.get("ram_critical_prev", False) and mem_pct <= MEM_WARN_PCT:
+            alerts.append({
+                "level": "INFO", "title": "RAM normal",
+                "detail": f"{mem_pct}%, sisa {mem_avail}MB",
+            })
+        prev["ram_critical_prev"] = mem_pct > MEM_WARN_PCT
+
+    level = "OK"
+    if any(a["level"] == "CRITICAL" for a in alerts):
+        level = "CRITICAL"
+    elif any(a["level"] == "ERROR" for a in alerts):
+        level = "ERROR"
+    elif any(a["level"] == "WARNING" for a in alerts):
+        level = "WARNING"
+
+    msg = TelegramMessage("MemStat", "📈", level=level)
+
+    if mem:
+        msg.add_table(["Memory", "Status"], [
+            ["RAM", f"`{bar(mem['pct'])}` {mem['pct']}% — {mem['used']}M/{mem['total']}M, sisa {mem['avail']}M"],
+            ["Swap", f"`{bar(mem['swap_pct'])}` {mem['swap_pct']}% — {mem['swap_used']}M/{mem['swap_total']}M"],
+        ])
+
+    for a in alerts:
+        msg.add_alert(a["level"], a["title"], a.get("detail", ""), a.get("saran", ""))
+
+    print(msg.render())
+    save_state(prev)
+    log.persist()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception:
+        log.exception("MemStat error", "Coba ulang")
+        report = log.format_report()
+        if report:
+            print(report)
+        log.persist()
+        sys.exit(1)

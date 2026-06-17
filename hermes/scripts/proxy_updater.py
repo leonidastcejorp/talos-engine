@@ -1,204 +1,239 @@
 #!/usr/bin/env python3
 """
-Talos Engine - Proxy Updater
-
-Downloads free proxy lists from public sources, tests them
-for connectivity, and saves working proxies to the pool file.
-
-Usage:
-    python scripts/proxy_updater.py
-    python scripts/proxy_updater.py --output data/proxies.txt
-    python scripts/proxy_updater.py --test-only
+🔄 Proxy Updater — Download + test free proxies dari berbagai sumber.
+Output ke cache. Stdout TABEL ringkas ke Telegram kalau ada perubahan berarti.
 """
+from __future__ import annotations
 
-import argparse
 import asyncio
+import json
+import os
+import re
 import sys
-import time
-from pathlib import Path
+from collections import defaultdict
+from datetime import datetime
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.error_log import log_error, ErrorLevel
+import aiohttp
 
-try:
-    import aiohttp
-except ImportError:
-    print("ERROR: aiohttp required. Install: pip install aiohttp")
-    sys.exit(1)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from telegram_ui import TelegramMessage, fmt_num
+from error_log import ErrorLog
 
-# Public free proxy sources
-PROXY_SOURCES: list[str] = [
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS.txt",
-]
+PROXY_DIR = "/root/projects/bounty-output/proxies"
+ALIVE_FILE = f"{PROXY_DIR}/alive.txt"
+STATE_FILE = os.path.expanduser("~/.hermes/scripts/.proxy_state.json")
+BATCH_SIZE = 200
+PROXY_TIMEOUT = 5
+MIN_ALIVE_THRESHOLD = 5
+CONCURRENCY = 100
 
-POOL_FILE = Path("data/proxies.txt")
-STATS_FILE = Path("data/proxy_stats.json")
+SOURCES = {
+    "shiftytr-http":   "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "hookzof-socks5":  "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    "anonymous-http":  "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt",
+    "roosterkid-https":"https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "proxyscrape-api": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+    "jetkai-http":     "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+    "prxchk-http":     "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+}
+
+IP_PORT_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$")
+log = ErrorLog("🔄 Proxy")
 
 
-async def fetch_proxies(url: str) -> list[str]:
-    """Download proxy list from a URL."""
+def is_valid_proxy(proxy: str) -> bool:
+    if not proxy or ":" not in proxy:
+        return False
+    p = proxy.strip()
+    if not IP_PORT_RE.match(p):
+        return False
+    parts = p.split(":")
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                text = await resp.text()
-                return [
-                    line.strip()
-                    for line in text.splitlines()
-                    if line.strip() and not line.startswith("#")
-                ]
-    except Exception as e:
-        log_error(
-            message=f"Failed to fetch proxies from {url}: {e}",
-            level=ErrorLevel.WARNING,
-            source="proxy_updater",
-        )
-        return []
+        for octet in parts[0].split("."):
+            v = int(octet)
+            if v < 0 or v > 255:
+                return False
+        port = int(parts[1])
+        if port < 1 or port > 65535:
+            return False
+    except ValueError:
+        return False
+    return True
 
 
-async def test_proxy(proxy_url: str, test_url: str, timeout: int = 10) -> tuple[str, bool, float]:
-    """Test a single proxy. Returns (url, alive, latency_ms)."""
-    start = time.monotonic()
+async def download_proxies(session) -> tuple[dict, list]:
+    source_proxies: dict[str, set] = defaultdict(set)
+    source_errors: dict[str, str] = {}
+
+    async def fetch_source(name, url):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                text = await r.text()
+                for line in text.strip().split("\n"):
+                    p = line.strip()
+                    if is_valid_proxy(p):
+                        source_proxies[name].add(p)
+        except Exception as e:
+            source_errors[name] = str(e)[:60]
+
+    await asyncio.gather(*(fetch_source(n, u) for n, u in SOURCES.items()))
+
+    all_unique = set()
+    for proxies in source_proxies.values():
+        all_unique.update(proxies)
+
+    if source_errors:
+        for name, err in source_errors.items():
+            log.warning(f"Gagal download {name}", err[:100], "Cek koneksi / source")
+
+    return source_proxies, list(all_unique)
+
+
+async def test_proxy(session, proxy, sem):
+    async with sem:
+        for proto in ["http", "https"]:
+            try:
+                async with session.get(
+                    "https://httpbin.org/ip",
+                    proxy=f"{proto}://{proxy}",
+                    timeout=aiohttp.ClientTimeout(total=PROXY_TIMEOUT),
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        return (proxy, data.get("origin", "?"), True)
+            except Exception:
+                pass
+    return (proxy, None, False)
+
+
+def load_state() -> dict:
+    if not os.path.exists(STATE_FILE):
+        return {"last_alive_count": 0, "last_run": None}
     try:
-        timeout_obj = aiohttp.ClientTimeout(total=timeout)
-        async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-            async with session.get(test_url, proxy=proxy_url) as resp:
-                latency = (time.monotonic() - start) * 1000
-                return (proxy_url, resp.status == 200, latency)
+        with open(STATE_FILE) as f:
+            return json.load(f)
     except Exception:
-        return (proxy_url, False, 0)
+        return {"last_alive_count": 0, "last_run": None}
 
 
-async def test_all(
-    proxies: list[str],
-    test_url: str = "https://httpbin.org/ip",
-    concurrency: int = 50,
-) -> dict:
-    """Test all proxies with controlled concurrency."""
-    semaphore = asyncio.Semaphore(concurrency)
-    results = {"alive": [], "dead": [], "total": len(proxies)}
-
-    async def worker(url: str):
-        async with semaphore:
-            url, alive, latency = await test_proxy(url, test_url)
-            if alive:
-                results["alive"].append({"url": url, "latency_ms": round(latency, 1)})
-            else:
-                results["dead"].append(url)
-
-    tasks = [worker(url) for url in proxies]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    return results
+def save_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except OSError:
+        log.error("Gagal simpan state", "File state gak bisa ditulis", "Cek disk")
 
 
-async def run_update(output_file: str, test_only: bool = False):
-    """Main update logic."""
-    print(f"\n{'='*60}")
-    print(f"  TALOS ENGINE - Proxy Updater")
-    print(f"{'='*60}\n")
+async def main_async() -> int:
+    os.makedirs(PROXY_DIR, exist_ok=True)
+    state = load_state()
 
-    if not test_only:
-        # Fetch fresh proxies
-        print("📥 Fetching proxy lists...")
-        all_proxies: set[str] = set()
-        for source in PROXY_SOURCES:
-            proxies = await fetch_proxies(source)
-            all_proxies.update(proxies)
-            print(f"   {source.split('/')[-2]}: {len(proxies)}")
-            await asyncio.sleep(0.5)
+    async with aiohttp.ClientSession() as session:
+        source_proxies, all_proxies = await download_proxies(session)
+        if not all_proxies:
+            log.error("Gagal download proxy", "Semua sumber error", "Cek koneksi / sources")
+            return 1
 
-        print(f"\n   Unique proxies collected: {len(all_proxies)}")
-        proxies_to_test = list(all_proxies)
-    else:
-        # Load existing proxies for testing
-        if Path(output_file).exists():
-            proxies_to_test = [
-                line.strip()
-                for line in Path(output_file).read_text().splitlines()
-                if line.strip() and not line.startswith("#")
-            ]
-            print(f"📂 Loaded {len(proxies_to_test)} proxies from {output_file}")
-        else:
-            print(f"❌ No proxy file at {output_file}")
-            return
+        # Save raw
+        with open(f"{PROXY_DIR}/raw_all.txt", "w") as f:
+            f.write("\n".join(all_proxies))
 
-    if not proxies_to_test:
-        print("No proxies to test.")
-        return
+        # Test batch
+        sem = asyncio.Semaphore(CONCURRENCY)
+        to_test = all_proxies[:BATCH_SIZE]
+        results = await asyncio.gather(*(test_proxy(session, p, sem) for p in to_test))
 
-    # Test
-    print(f"\n🧪 Testing {len(proxies_to_test)} proxies...")
-    results = await test_all(proxies_to_test)
-    alive_count = len(results["alive"])
-    dead_count = len(results["dead"])
+    alive = [r[0] for r in results if r[2]]
+    proxy_to_sources: dict[str, list[str]] = {}
+    for src, proxies in source_proxies.items():
+        for p in proxies:
+            proxy_to_sources.setdefault(p, []).append(src)
 
-    print(f"\n   Results:")
-    print(f"   ✅ Alive: {alive_count}")
-    print(f"   ❌ Dead:  {dead_count}")
-    print(f"   📊 Success rate: {alive_count / max(results['total'], 1) * 100:.1f}%")
+    source_alive: dict[str, int] = defaultdict(int)
+    for proxy in alive:
+        for s in proxy_to_sources.get(proxy, ["unknown"]):
+            source_alive[s] += 1
 
-    # Save
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save alive
+    if len(alive) >= MIN_ALIVE_THRESHOLD:
+        with open(ALIVE_FILE, "w") as f:
+            f.write("\n".join(alive))
 
-    # Sort alive by latency
-    results["alive"].sort(key=lambda p: p["latency_ms"])
-    content = "\n".join(p["url"] for p in results["alive"])
-    output_path.write_text(content)
-    print(f"\n📁 Saved {alive_count} working proxies to {output_file}")
+    # Decide: notify kalau significant change
+    prev_count = state.get("last_alive_count", 0)
+    diff = len(alive) - prev_count
+    pct_change = abs(diff) * 100 / max(prev_count, 1)
 
-    # Save stats
-    STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    import json as _json
-    stats = {
-        "updated": time.time(),
-        "total_tested": results["total"],
-        "alive": alive_count,
-        "dead": dead_count,
-        "top_latency_ms": results["alive"][0]["latency_ms"] if results["alive"] else 0,
-        "avg_latency_ms": (
-            round(sum(p["latency_ms"] for p in results["alive"]) / alive_count, 1)
-            if alive_count > 0
-            else 0
-        ),
-    }
-    STATS_FILE.write_text(_json.dumps(stats, indent=2))
+    significant = (
+        len(alive) < MIN_ALIVE_THRESHOLD or       # under threshold — alert
+        pct_change > 30 or                          # change > 30%
+        (prev_count > 0 and len(alive) == 0)        # all dead
+    )
 
-    if alive_count < 10:
-        log_error(
-            message=f"Proxy pool low: only {alive_count} working proxies",
-            level=ErrorLevel.WARNING,
-            source="proxy_updater",
+    save_state({
+        "last_alive_count": len(alive),
+        "last_run": datetime.now().isoformat(),
+    })
+
+    if not significant:
+        return 0  # silent
+
+    # Compose Telegram message
+    level = "ERROR" if len(alive) < MIN_ALIVE_THRESHOLD else "OK"
+    msg = TelegramMessage("Proxy Updater", "🔄", level=level)
+
+    msg.add_table(
+        ["Metric", "Value"],
+        [
+            ["Dites", f"{len(to_test)} dari {len(all_proxies)} total"],
+            ["Hidup", f"{len(alive)} ({len(alive)/max(len(to_test),1)*100:.1f}%)"],
+            ["Mati", f"{len(to_test) - len(alive)}"],
+            ["Perubahan", f"{diff:+d} dari run sebelumnya"],
+        ],
+    )
+
+    if source_alive:
+        rows = sorted(source_alive.items(), key=lambda x: x[1], reverse=True)[:5]
+        msg.add_table(
+            ["Source", "Hidup"],
+            [[name, str(n)] for name, n in rows],
+            caption="Top 5 sumber",
         )
 
+    if len(alive) < MIN_ALIVE_THRESHOLD:
+        msg.add_alert("ERROR", "Pool proxy menipis",
+                      f"Cuma {len(alive)} proxy hidup (min {MIN_ALIVE_THRESHOLD})",
+                      "Cek koneksi atau tambah source")
+    elif prev_count == 0 and len(alive) > 0:
+        msg.add_alert("INFO", "Pool proxy pertama kali",
+                      f"{len(alive)} proxy hidup tersimpan")
+    elif pct_change > 30:
+        msg.add_alert("WARNING", "Pool proxy berubah signifikan",
+                      f"{diff:+d} ({pct_change:.0f}%)",
+                      "Cek kualitas source")
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Talos Engine - Proxy Updater"
-    )
-    parser.add_argument(
-        "--output", type=str, default=str(POOL_FILE),
-        help="Output proxy pool file",
-    )
-    parser.add_argument(
-        "--test-only", action="store_true",
-        help="Only test existing proxies (skip fetching)",
-    )
-    args = parser.parse_args()
+    print(msg.render())
+    return 0
 
-    asyncio.run(run_update(args.output, args.test_only))
+
+def main() -> int:
+    try:
+        return asyncio.run(main_async())
+    except Exception:
+        log.exception("Proxy Updater error", "Cek dependencies & koneksi")
+        report = log.format_report()
+        if report:
+            print(report)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception:
+        log.exception("Proxy fatal error", "")
+        report = log.format_report()
+        if report:
+            print(report)
+        sys.exit(1)
