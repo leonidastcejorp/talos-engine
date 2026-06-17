@@ -12,7 +12,6 @@ python-dotenv>=1.2
 eth-account>=0.13
 mnemonic>=0.21
 cryptography>=42.0
-web3>=7.0
 
 # Bounty infrastructure
 jinja2>=3.1

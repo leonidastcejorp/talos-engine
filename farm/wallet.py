@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-✈️ Farm Wallet Manager — encrypted HD wallet storage for EVM + Solana airdrops.
+✈️ Farm Wallet Manager — encrypted HD wallet storage for EVM airdrops.
 
 Usage:
     from farm.wallet import WalletManager
@@ -10,6 +10,7 @@ Usage:
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
@@ -27,7 +28,6 @@ def _derive_key(password: str, salt: bytes) -> bytes:
     """Derive Fernet key from password + salt using PBKDF2HMAC."""
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.hazmat.primitives import hashes
-    from base64 import urlsafe_b64encode
 
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
@@ -35,7 +35,7 @@ def _derive_key(password: str, salt: bytes) -> bytes:
         salt=salt,
         iterations=480_000,
     )
-    return urlsafe_b64encode(kdf.derive(password.encode()))
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
 
 @dataclass
@@ -57,30 +57,36 @@ class WalletManager:
         self._data: dict = {"salt": "", "wallets": []}
         self._load()
 
+    def _fernet(self) -> Fernet:
+        salt = bytes.fromhex(self._data["salt"])
+        return Fernet(_derive_key(self.password, salt))
+
     def _load(self) -> None:
-        if not self.path.exists():
+        if not self.path.exists() or self.path.stat().st_size == 0:
             self._data = {
                 "salt": secrets.token_hex(16),
                 "wallets": [],
                 "meta": {"created": datetime.now().isoformat(), "version": 1},
             }
             return
-        raw = self.path.read_bytes()
-        if not raw:
-            raise ValueError("wallet file is empty")
-        self._data = json.loads(raw)
+        envelope = json.loads(self.path.read_text())
+        salt = bytes.fromhex(envelope["salt"])
+        f = Fernet(_derive_key(self.password, salt))
+        payload = f.decrypt(envelope["payload"].encode())
+        self._data = json.loads(payload)
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         salt = bytes.fromhex(self._data["salt"])
         f = Fernet(_derive_key(self.password, salt))
-        encrypted = f.encrypt(json.dumps(self._data).encode())
-        self.path.write_bytes(encrypted)
+        payload = f.encrypt(json.dumps(self._data).encode())
+        envelope = {
+            "salt": self._data["salt"],
+            "payload": payload.decode(),
+            "meta": {"saved": datetime.now().isoformat(), "version": 1},
+        }
+        self.path.write_text(json.dumps(envelope))
         os.chmod(self.path, 0o600)
-
-    def _fernet(self) -> Fernet:
-        salt = bytes.fromhex(self._data["salt"])
-        return Fernet(_derive_key(self.password, salt))
 
     def list_wallets(self, chain: Optional[str] = None, tag: Optional[str] = None) -> list[Wallet]:
         wallets = [Wallet(**w) for w in self._data["wallets"]]
@@ -89,6 +95,9 @@ class WalletManager:
         if tag:
             wallets = [w for w in wallets if tag in w.tags]
         return wallets
+
+    def count(self, chain: Optional[str] = None, tag: Optional[str] = None) -> int:
+        return len(self.list_wallets(chain, tag))
 
     def create_evm(self, label: str, tags: Optional[list[str]] = None) -> Wallet:
         """Create a new EVM wallet from random mnemonic."""
